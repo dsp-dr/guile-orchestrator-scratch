@@ -5,7 +5,6 @@
   #:use-module (srfi srfi-9)
   #:use-module (srfi srfi-19)
   #:use-module (srfi srfi-34)
-  #:use-module (srfi srfi-35)
   #:export (;; Error types
             make-orchestrator-error
             orchestrator-error?
@@ -35,12 +34,7 @@
             define-recovery-strategy
             recover-from-error))
 
-(define-condition-type &orchestrator-error &error
-  make-orchestrator-error-condition
-  orchestrator-error-condition?
-  (code error-condition-code)
-  (context error-condition-context))
-
+;; Simple error record type (SRFI-35 not widely available)
 (define-record-type <orchestrator-error>
   (%make-orchestrator-error type code message context timestamp)
   orchestrator-error?

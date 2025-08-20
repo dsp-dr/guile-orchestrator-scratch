@@ -23,7 +23,7 @@
             child-spec?))
 
 (define-record-type <supervisor>
-  (%make-supervisor id strategy children max-restarts restart-window)
+  (%make-supervisor id strategy children max-restarts restart-window restart-counts)
   supervisor?
   (id supervisor-id)
   (strategy supervisor-strategy)
