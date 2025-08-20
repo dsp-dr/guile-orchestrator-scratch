@@ -8,6 +8,9 @@
   <img src="https://img.shields.io/badge/guile-3.0+-blue.svg" alt="Guile 3.0+">
   <img src="https://img.shields.io/badge/platform-FreeBSD-red.svg" alt="FreeBSD">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
+  <img src="https://img.shields.io/badge/private-repository-lightgrey.svg" alt="Private Repository">
+  <img src="https://img.shields.io/badge/architecture-actor--model-brightgreen.svg" alt="Actor Model">
+  <img src="https://img.shields.io/badge/lines%20of%20code-2.4k-blue.svg" alt="Lines of Code">
 </p>
 #+END_EXPORT
 
