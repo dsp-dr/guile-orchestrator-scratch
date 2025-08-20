@@ -1,0 +1,268 @@
+#+TITLE: Guile Orchestrator - A Distributed Systems Orchestration Framework
+#+AUTHOR: dsp-dr
+#+DATE: 2025-08-20
+
+#+BEGIN_EXPORT html
+<p align="center">
+  <img src="https://img.shields.io/badge/status-experimental-orange.svg" alt="Experimental">
+  <img src="https://img.shields.io/badge/guile-3.0+-blue.svg" alt="Guile 3.0+">
+  <img src="https://img.shields.io/badge/platform-FreeBSD-red.svg" alt="FreeBSD">
+  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
+</p>
+#+END_EXPORT
+
+* Overview
+
+Guile Orchestrator is a distributed systems orchestration framework implemented in Guile Scheme 3.0+, designed for FreeBSD systems. This project adapts orchestration patterns from modern distributed systems literature into a functional, Scheme-based architecture leveraging Guile's powerful features including Fibers for concurrency, delimited continuations for control flow, and GOOPS for extensible component design.
+
+** Key Features
+
+- Actor-based concurrency model using Guile Fibers
+- Declarative orchestration DSL via Guile macros
+- Content-addressable task storage
+- Distributed coordination with eventual consistency
+- FreeBSD-specific optimizations (kqueue, jail integration)
+- Literate programming approach with org-mode
+
+** Architecture Overview
+
+#+BEGIN_SRC mermaid :file architecture.png :exports results
+graph TB
+    subgraph "Orchestrator Core"
+        AM[Actor Manager]
+        TS[Task Scheduler]
+        SM[State Machine]
+        ES[Event Store]
+    end
+    
+    subgraph "Communication Layer"
+        FB[Fiber Pool]
+        MP[Message Passing]
+        NP[Network Protocol]
+    end
+    
+    subgraph "Storage Layer"
+        CAS[Content-Addressable Store]
+        WAL[Write-Ahead Log]
+        SS[Snapshot Store]
+    end
+    
+    subgraph "External Systems"
+        KQ[kqueue Events]
+        JL[FreeBSD Jails]
+        EX[External Services]
+    end
+    
+    AM --> FB
+    TS --> AM
+    SM --> ES
+    ES --> WAL
+    
+    FB --> MP
+    MP --> NP
+    
+    AM --> CAS
+    TS --> CAS
+    
+    KQ --> FB
+    JL --> AM
+    EX --> NP
+    
+    style AM fill:#f9f,stroke:#333,stroke-width:2px
+    style TS fill:#bbf,stroke:#333,stroke-width:2px
+    style FB fill:#bfb,stroke:#333,stroke-width:2px
+#+END_SRC
+
+* Installation
+
+** Prerequisites
+
+- FreeBSD 14.3 or later
+- Guile 3.0.10 or later
+- GNU Make 4.4+
+- Git
+
+** Building from Source
+
+#+BEGIN_SRC bash
+# Clone the repository
+git clone https://github.com/dsp-dr/guile-orchestrator.git
+cd guile-orchestrator
+
+# Build the project
+gmake all
+
+# Run tests
+gmake test
+
+# Install (optional)
+gmake install PREFIX=/usr/local
+#+END_SRC
+
+* Usage
+
+** Quick Start
+
+#+BEGIN_SRC scheme
+(use-modules (orchestrator core)
+             (orchestrator actors)
+             (orchestrator tasks))
+
+;; Define an actor
+(define-actor worker
+  ((process task)
+   (format #t "Processing ~a~%" task)
+   (task-complete! task)))
+
+;; Create orchestrator instance
+(define orch (make-orchestrator))
+
+;; Submit a task
+(submit-task orch 
+  (make-task 'data-processing 
+             #:payload '((input . "data.csv")
+                        (output . "result.json"))))
+
+;; Start orchestration
+(orchestrator-run! orch)
+#+END_SRC
+
+** Declarative Orchestration
+
+#+BEGIN_SRC scheme
+(define-orchestration data-pipeline
+  (stage extract
+    #:actors 3
+    #:handler extract-data)
+  
+  (stage transform
+    #:actors 5
+    #:depends-on (extract)
+    #:handler transform-data)
+  
+  (stage load
+    #:actors 2
+    #:depends-on (transform)
+    #:handler load-data))
+
+(execute-orchestration data-pipeline input-data)
+#+END_SRC
+
+* Development Roadmap
+
+** Pre-v1.0.0 Milestones
+
+*** v0.1.0 - Core Actor System
+- [X] Basic actor implementation with Fibers
+- [X] Message passing infrastructure
+- [X] Actor supervision tree
+- [ ] Unit tests for actor system
+
+*** v0.2.0 - Task Management
+- [ ] Task definition DSL
+- [ ] Task scheduling algorithms
+- [ ] Priority queue implementation
+- [ ] Task persistence layer
+
+*** v0.3.0 - State Machine Engine
+- [ ] FSM implementation using delimited continuations
+- [ ] State persistence and recovery
+- [ ] Event sourcing integration
+- [ ] Snapshot mechanism
+
+*** v0.4.0 - Distributed Coordination
+- [ ] Gossip protocol implementation
+- [ ] Consensus algorithm (Raft/Paxos)
+- [ ] Distributed lock service
+- [ ] Membership management
+
+*** v0.5.0 - Storage Layer
+- [ ] Content-addressable storage
+- [ ] Write-ahead logging
+- [ ] Compaction strategies
+- [ ] Storage benchmarks
+
+*** v0.6.0 - FreeBSD Integration
+- [ ] kqueue event integration
+- [ ] Jail orchestration support
+- [ ] Resource limits via rctl
+- [ ] ZFS snapshot integration
+
+*** v0.7.0 - Observability
+- [ ] Metrics collection
+- [ ] Distributed tracing
+- [ ] Health check system
+- [ ] Performance profiling
+
+*** v0.8.0 - API and Documentation
+- [ ] REST API gateway
+- [ ] GraphQL interface
+- [ ] API documentation
+- [ ] Tutorial examples
+
+*** v0.9.0 - Testing and Hardening
+- [ ] Chaos testing framework
+- [ ] Property-based testing
+- [ ] Load testing suite
+- [ ] Security audit
+
+*** v1.0.0 - Production Release
+- [ ] Feature freeze
+- [ ] Performance validation
+- [ ] Migration guides
+- [ ] Production deployment docs
+
+* Project Structure
+
+#+BEGIN_SRC text
+guile-orchestrator/
+├── README.org                 # This file
+├── Makefile                  # GNU Make build automation
+├── guix.scm                  # Guix package definition
+├── .envrc                    # direnv configuration
+├── src/                      # Source code (tangled from docs/)
+│   ├── orchestrator/
+│   │   ├── core.scm         # Core orchestrator logic
+│   │   ├── actors.scm       # Actor system implementation
+│   │   ├── tasks.scm        # Task management
+│   │   ├── state.scm        # State machine engine
+│   │   ├── storage.scm      # Storage layer
+│   │   └── network.scm      # Network protocols
+│   └── main.scm             # Entry point
+├── tests/                    # Test suite
+│   ├── orchestrator/
+│   │   ├── core-test.scm
+│   │   ├── actors-test.scm
+│   │   └── tasks-test.scm
+│   └── test-runner.scm      # Test suite runner
+├── docs/                     # Literate programming source
+│   ├── implementation.org    # Implementation details
+│   ├── design.org           # Design decisions
+│   ├── api.org              # API documentation
+│   └── notes.org            # Development notes
+├── examples/                 # Example applications
+│   ├── web-crawler.scm      # Distributed web crawler
+│   ├── map-reduce.scm       # MapReduce implementation
+│   └── pipeline.scm         # Data pipeline example
+└── tmp/                      # Temporary files (ignored)
+#+END_SRC
+
+* Contributing
+
+Contributions are welcome! Please see [[file:CONTRIBUTING.org][CONTRIBUTING.org]] for guidelines.
+
+* License
+
+This project is licensed under the MIT License. See [[file:LICENSE][LICENSE]] for details.
+
+* References
+
+- [[https://www.gnu.org/software/guile/][GNU Guile Official Documentation]]
+- [[https://github.com/wingo/fibers][Guile Fibers Documentation]]
+- [[https://www.freebsd.org/][FreeBSD Project]]
+- Distributed Systems: Principles and Paradigms (Tanenbaum & Van Steen)
+- Designing Data-Intensive Applications (Martin Kleppmann)
+
+* GitHub Topics
+
+~guile~ ~scheme~ ~orchestration~ ~distributed-systems~ ~actor-model~ ~freebsd~ ~fibers~ ~concurrency~ ~orchestrator~ ~task-scheduler~

@@ -1,0 +1,16 @@
+*.fasl
+*.go
+*.log
+*.tmp
+*~
+.#*
+\#*#
+/tmp/
+/build/
+/dist/
+.envrc.local
+.direnv/
+TAGS
+GTAGS
+GPATH
+GRTAGS

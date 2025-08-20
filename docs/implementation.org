@@ -1,0 +1,457 @@
+#+TITLE: Orchestrator Core Implementation
+#+PROPERTY: header-args:scheme :mkdirp t
+#+PROPERTY: header-args :exports code :noweb yes
+
+* Overview
+
+This document contains the literate implementation of the Guile Orchestrator framework. Each section corresponds to a module in the system, with code blocks that tangle to the appropriate source files.
+
+* Core Module
+:PROPERTIES:
+:header-args:scheme: :tangle ../src/orchestrator/core.scm
+:END:
+
+** Module Definition
+
+#+BEGIN_SRC scheme
+(define-module (orchestrator core)
+  #:use-module (ice-9 match)
+  #:use-module (ice-9 atomic)
+  #:use-module (ice-9 threads)
+  #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-9)
+  #:use-module (srfi srfi-9 gnu)
+  #:export (make-orchestrator
+            orchestrator?
+            orchestrator-run!
+            orchestrator-stop!
+            orchestrator-submit!
+            orchestrator-status
+            make-channel
+            put-message
+            get-message))
+#+END_SRC
+
+** Channel Implementation
+
+#+BEGIN_SRC scheme
+(define-record-type <channel>
+  (%make-channel queue mutex condvar)
+  channel?
+  (queue channel-queue set-channel-queue!)
+  (mutex channel-mutex)
+  (condvar channel-condvar))
+
+(define (make-channel)
+  (%make-channel '() (make-mutex) (make-condition-variable)))
+
+(define (put-message channel msg)
+  (with-mutex (channel-mutex channel)
+    (set-channel-queue! channel
+                        (append (channel-queue channel) (list msg)))
+    (signal-condition-variable (channel-condvar channel))))
+
+(define (get-message channel)
+  (with-mutex (channel-mutex channel)
+    (while (null? (channel-queue channel))
+      (wait-condition-variable (channel-condvar channel)
+                               (channel-mutex channel)))
+    (let ((msg (car (channel-queue channel))))
+      (set-channel-queue! channel (cdr (channel-queue channel)))
+      msg)))
+#+END_SRC
+
+** Data Types
+
+#+BEGIN_SRC scheme
+(define-record-type <orchestrator>
+  (%make-orchestrator id actors tasks state channel running?)
+  orchestrator?
+  (id orchestrator-id)
+  (actors orchestrator-actors set-orchestrator-actors!)
+  (tasks orchestrator-tasks set-orchestrator-tasks!)
+  (state orchestrator-state set-orchestrator-state!)
+  (channel orchestrator-channel)
+  (running? orchestrator-running? set-orchestrator-running?!))
+
+(set-record-type-printer! <orchestrator>
+  (lambda (record port)
+    (format port "#<orchestrator ~a ~a>"
+            (orchestrator-id record)
+            (if (orchestrator-running? record) "running" "stopped"))))
+#+END_SRC
+
+** Constructor
+
+#+BEGIN_SRC scheme
+(define* (make-orchestrator #:key (id (generate-id)))
+  (%make-orchestrator
+   id
+   '()                    ; actors
+   (make-atomic-box '())  ; tasks
+   (make-atomic-box 'idle) ; state
+   (make-channel)         ; control channel
+   #f))                   ; running?
+
+(define (generate-id)
+  (format #f "orch-~a" (random 1000000)))
+#+END_SRC
+
+** Core Operations
+
+#+BEGIN_SRC scheme
+(define (orchestrator-run! orch)
+  (unless (orchestrator-running? orch)
+    (set-orchestrator-running?! orch #t)
+    (call-with-new-thread
+     (lambda ()
+       (orchestrator-loop orch)))))
+
+(define (orchestrator-stop! orch)
+  (when (orchestrator-running? orch)
+    (put-message (orchestrator-channel orch) 'stop)
+    (set-orchestrator-running?! orch #f)))
+
+(define (orchestrator-submit! orch task)
+  (let ((tasks-box (orchestrator-tasks orch)))
+    (atomic-box-set! tasks-box
+                     (cons task (atomic-box-ref tasks-box))))
+  (put-message (orchestrator-channel orch) `(task ,task)))
+
+(define (orchestrator-status orch)
+  `((id . ,(orchestrator-id orch))
+    (running . ,(orchestrator-running? orch))
+    (state . ,(atomic-box-ref (orchestrator-state orch)))
+    (task-count . ,(length (atomic-box-ref (orchestrator-tasks orch))))
+    (actor-count . ,(length (orchestrator-actors orch)))))
+#+END_SRC
+
+** Event Loop
+
+#+BEGIN_SRC scheme
+(define (orchestrator-loop orch)
+  (let loop ()
+    (match (get-message (orchestrator-channel orch))
+      ('stop
+       (format #t "Orchestrator ~a stopping~%" (orchestrator-id orch)))
+      
+      (('task task)
+       (process-task orch task)
+       (loop))
+      
+      (('actor-ready actor)
+       (assign-task-to-actor orch actor)
+       (loop))
+      
+      (msg
+       (format #t "Unknown message: ~a~%" msg)
+       (loop)))))
+
+(define (process-task orch task)
+  (atomic-box-set! (orchestrator-state orch) 'processing)
+  (format #t "Processing task: ~a~%" task))
+
+(define (assign-task-to-actor orch actor)
+  (let ((tasks (atomic-box-ref (orchestrator-tasks orch))))
+    (unless (null? tasks)
+      (let ((task (car tasks)))
+        (atomic-box-set! (orchestrator-tasks orch) (cdr tasks))
+        (format #t "Assigning ~a to ~a~%" task actor)))))
+#+END_SRC
+
+* Actor System
+:PROPERTIES:
+:header-args:scheme: :tangle ../src/orchestrator/actors.scm
+:END:
+
+** Module Definition
+
+#+BEGIN_SRC scheme
+(define-module (orchestrator actors)
+  #:use-module (ice-9 match)
+  #:use-module (ice-9 threads)
+  #:use-module (srfi srfi-9)
+  #:use-module (srfi srfi-9 gnu)
+  #:use-module (orchestrator core)
+  #:export (make-actor
+            actor?
+            actor-id
+            actor-send!
+            actor-receive
+            spawn-actor
+            define-actor))
+#+END_SRC
+
+** Actor Data Type
+
+#+BEGIN_SRC scheme
+(define-record-type <actor>
+  (%make-actor id mailbox handler state)
+  actor?
+  (id actor-id)
+  (mailbox actor-mailbox)
+  (handler actor-handler set-actor-handler!)
+  (state actor-state set-actor-state!))
+
+(set-record-type-printer! <actor>
+  (lambda (record port)
+    (format port "#<actor ~a>" (actor-id record))))
+#+END_SRC
+
+** Actor Creation
+
+#+BEGIN_SRC scheme
+(define* (make-actor handler #:key (id (generate-actor-id)) (initial-state '()))
+  (%make-actor id (make-channel) handler initial-state))
+
+(define (generate-actor-id)
+  (format #f "actor-~a" (random 1000000)))
+
+(define (actor-send! actor message)
+  (put-message (actor-mailbox actor) message))
+
+(define (actor-receive actor)
+  (get-message (actor-mailbox actor)))
+#+END_SRC
+
+** Actor Spawning
+
+#+BEGIN_SRC scheme
+(define (spawn-actor actor)
+  (call-with-new-thread
+   (lambda ()
+     (actor-loop actor))))
+
+(define (actor-loop actor)
+  (let loop ((state (actor-state actor)))
+    (let* ((message (actor-receive actor))
+           (handler (actor-handler actor))
+           (new-state (handler state message)))
+      (set-actor-state! actor new-state)
+      (unless (eq? new-state 'stop)
+        (loop new-state)))))
+#+END_SRC
+
+** Actor Definition Macro
+
+#+BEGIN_SRC scheme
+(define-syntax define-actor
+  (syntax-rules ()
+    ((define-actor name ((message-pattern ...) body ...) ...)
+     (define name
+       (lambda (state message)
+         (match message
+           ((message-pattern ...)
+            body ...)
+           ...
+           (_
+            (format #t "Unhandled message: ~a~%" message)
+            state)))))))
+#+END_SRC
+
+* Task Management
+:PROPERTIES:
+:header-args:scheme: :tangle ../src/orchestrator/tasks.scm
+:END:
+
+** Module Definition
+
+#+BEGIN_SRC scheme
+(define-module (orchestrator tasks)
+  #:use-module (ice-9 match)
+  #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-9)
+  #:use-module (srfi srfi-19)
+  #:export (make-task
+            task?
+            task-id
+            task-type
+            task-payload
+            task-status
+            task-complete!
+            task-fail!))
+#+END_SRC
+
+** Task Data Type
+
+#+BEGIN_SRC scheme
+(define-record-type <task>
+  (%make-task id type payload status created-at updated-at)
+  task?
+  (id task-id)
+  (type task-type)
+  (payload task-payload)
+  (status task-status set-task-status!)
+  (created-at task-created-at)
+  (updated-at task-updated-at set-task-updated-at!))
+#+END_SRC
+
+** Task Operations
+
+#+BEGIN_SRC scheme
+(define* (make-task type #:key (payload '()) (id (generate-task-id)))
+  (let ((now (current-time)))
+    (%make-task id type payload 'pending now now)))
+
+(define (generate-task-id)
+  (format #f "task-~a-~a" 
+          (time-second (current-time))
+          (random 10000)))
+
+(define (task-complete! task)
+  (set-task-status! task 'completed)
+  (set-task-updated-at! task (current-time))
+  task)
+
+(define (task-fail! task reason)
+  (set-task-status! task `(failed . ,reason))
+  (set-task-updated-at! task (current-time))
+  task)
+#+END_SRC
+
+* Tests
+:PROPERTIES:
+:header-args:scheme: :tangle ../tests/test-runner.scm
+:END:
+
+** Test Runner
+
+#+BEGIN_SRC scheme
+#!/usr/bin/env guile3
+!#
+
+(use-modules (srfi srfi-64)
+             (ice-9 ftw)
+             (ice-9 regex))
+
+(define (find-test-files dir)
+  (let ((test-files '()))
+    (ftw dir
+         (lambda (filename statinfo flag)
+           (when (and (eq? flag 'regular)
+                      (string-match ".*-test\\.scm$" filename))
+             (set! test-files (cons filename test-files)))
+           #t))
+    (reverse test-files)))
+
+(define (run-test-file file)
+  (format #t "Running tests from ~a...~%" file)
+  (load file))
+
+(define (main args)
+  (test-runner-factory
+   (lambda ()
+     (let ((runner (test-runner-simple)))
+       (test-runner-on-final! runner
+         (lambda (runner)
+           (format #t "~%Test Summary:~%")
+           (format #t "  Passed: ~a~%" (test-runner-pass-count runner))
+           (format #t "  Failed: ~a~%" (test-runner-fail-count runner))
+           (format #t "  Skipped: ~a~%~%" (test-runner-skip-count runner))))
+       runner)))
+  
+  (let ((test-files (find-test-files "tests")))
+    (for-each run-test-file test-files))
+  
+  (exit (if (zero? (test-runner-fail-count (test-runner-current))) 0 1)))
+
+(main (command-line))
+#+END_SRC
+
+* Core Tests
+:PROPERTIES:
+:header-args:scheme: :tangle ../tests/orchestrator/core-test.scm
+:END:
+
+#+BEGIN_SRC scheme
+(define-module (tests orchestrator core-test)
+  #:use-module (srfi srfi-64)
+  #:use-module (orchestrator core))
+
+(test-begin "orchestrator-core")
+
+(test-assert "create orchestrator"
+  (orchestrator? (make-orchestrator)))
+
+(test-equal "orchestrator initial state"
+  'idle
+  (let ((orch (make-orchestrator)))
+    (assoc-ref (orchestrator-status orch) 'state)))
+
+(test-equal "orchestrator task submission"
+  1
+  (let ((orch (make-orchestrator)))
+    (orchestrator-submit! orch '(test-task))
+    (assoc-ref (orchestrator-status orch) 'task-count)))
+
+(test-end "orchestrator-core")
+#+END_SRC
+
+* Actor Tests
+:PROPERTIES:
+:header-args:scheme: :tangle ../tests/orchestrator/actors-test.scm
+:END:
+
+#+BEGIN_SRC scheme
+(define-module (tests orchestrator actors-test)
+  #:use-module (srfi srfi-64)
+  #:use-module (orchestrator actors))
+
+(test-begin "orchestrator-actors")
+
+(test-assert "create actor"
+  (actor? (make-actor (lambda (state msg) state))))
+
+(test-equal "actor id generation"
+  #t
+  (string-prefix? "actor-" (actor-id (make-actor (lambda (s m) s)))))
+
+(define-actor test-actor
+  ((ping) 'pong)
+  ((add x y) (+ x y))
+  ((stop) 'stop))
+
+(test-equal "actor message handling"
+  'pong
+  (test-actor '() '(ping)))
+
+(test-equal "actor computation"
+  5
+  (test-actor '() '(add 2 3)))
+
+(test-end "orchestrator-actors")
+#+END_SRC
+
+* Task Tests
+:PROPERTIES:
+:header-args:scheme: :tangle ../tests/orchestrator/tasks-test.scm
+:END:
+
+#+BEGIN_SRC scheme
+(define-module (tests orchestrator tasks-test)
+  #:use-module (srfi srfi-64)
+  #:use-module (orchestrator tasks))
+
+(test-begin "orchestrator-tasks")
+
+(test-assert "create task"
+  (task? (make-task 'test)))
+
+(test-equal "task initial status"
+  'pending
+  (task-status (make-task 'test)))
+
+(test-equal "task completion"
+  'completed
+  (let ((task (make-task 'test)))
+    (task-complete! task)
+    (task-status task)))
+
+(test-equal "task failure"
+  'failed
+  (let ((task (make-task 'test)))
+    (task-fail! task "error")
+    (car (task-status task))))
+
+(test-end "orchestrator-tasks")
+#+END_SRC

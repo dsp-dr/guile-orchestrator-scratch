@@ -1,0 +1,341 @@
+#+TITLE: Orchestrator Design Documentation
+#+AUTHOR: dsp-dr
+#+DATE: 2025-08-20
+
+* System Architecture
+
+** Overview
+
+The Guile Orchestrator follows an actor-based architecture pattern, leveraging Guile's Fibers library for lightweight concurrency. The system is designed to be:
+
+- *Distributed*: Can coordinate tasks across multiple nodes
+- *Fault-tolerant*: Handles actor failures gracefully
+- *Scalable*: Actors can be dynamically spawned based on load
+- *Functional*: Emphasizes immutability and pure functions
+
+** Component Interaction
+
+#+BEGIN_SRC mermaid :file component-flow.png :exports results
+sequenceDiagram
+    participant Client
+    participant Orchestrator
+    participant TaskQueue
+    participant ActorPool
+    participant Actor
+    participant Storage
+    
+    Client->>Orchestrator: submit_task(task)
+    Orchestrator->>TaskQueue: enqueue(task)
+    Orchestrator->>Storage: persist(task)
+    
+    ActorPool->>Orchestrator: request_work()
+    Orchestrator->>TaskQueue: dequeue()
+    TaskQueue-->>Orchestrator: task
+    Orchestrator->>Actor: assign(task)
+    
+    Actor->>Actor: process(task)
+    Actor->>Storage: save_result()
+    Actor->>Orchestrator: complete(task_id)
+    
+    Orchestrator->>Client: notify(completion)
+#+END_SRC
+
+** State Management
+
+#+BEGIN_SRC mermaid :file state-machine.png :exports results
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Ready: start()
+    Ready --> Processing: task_received
+    Processing --> Ready: task_complete
+    Processing --> Failed: error
+    Failed --> Ready: retry
+    Ready --> Stopping: stop()
+    Stopping --> [*]
+    
+    Processing --> Processing: concurrent_tasks
+#+END_SRC
+
+* Design Patterns
+
+** Actor Model Implementation
+
+We implement the Actor Model using Guile Fibers, where each actor:
+
+1. Has a unique identity
+2. Maintains private state
+3. Communicates only through message passing
+4. Can spawn new actors
+5. Processes messages sequentially
+
+#+BEGIN_SRC scheme :tangle no
+;; Actor lifecycle
+(define (actor-lifecycle)
+  '((created . "Actor instantiated")
+    (initialized . "Actor state initialized")
+    (running . "Processing messages")
+    (suspended . "Temporarily paused")
+    (terminated . "Actor stopped")))
+#+END_SRC
+
+** Message Passing Protocol
+
+Messages follow a standard format:
+
+#+BEGIN_SRC scheme :tangle no
+(define-message-type
+  (header
+   (id "unique-message-id")
+   (from "sender-actor-id")
+   (to "recipient-actor-id")
+   (timestamp "ISO-8601"))
+  (body
+   (type 'request|'response|'event)
+   (payload any)))
+#+END_SRC
+
+** Supervision Tree
+
+#+BEGIN_SRC mermaid :file supervision-tree.png :exports results
+graph TD
+    RS[Root Supervisor]
+    OS[Orchestrator Supervisor]
+    AS[Actor Supervisor]
+    SS[Storage Supervisor]
+    
+    O1[Orchestrator 1]
+    O2[Orchestrator 2]
+    
+    A1[Actor Pool 1]
+    A2[Actor Pool 2]
+    A3[Actor Pool 3]
+    
+    S1[Storage Writer]
+    S2[Storage Reader]
+    
+    RS --> OS
+    RS --> AS
+    RS --> SS
+    
+    OS --> O1
+    OS --> O2
+    
+    AS --> A1
+    AS --> A2
+    AS --> A3
+    
+    SS --> S1
+    SS --> S2
+    
+    style RS fill:#f96,stroke:#333,stroke-width:4px
+    style OS fill:#69f,stroke:#333,stroke-width:2px
+    style AS fill:#69f,stroke:#333,stroke-width:2px
+    style SS fill:#69f,stroke:#333,stroke-width:2px
+#+END_SRC
+
+* Concurrency Model
+
+** Fiber-based Concurrency
+
+We use Guile Fibers for:
+
+- *Lightweight threads*: Thousands of concurrent actors
+- *CSP-style channels*: Type-safe communication
+- *Cooperative scheduling*: Predictable performance
+- *Non-blocking I/O*: Efficient resource utilization
+
+** Synchronization Primitives
+
+#+BEGIN_SRC scheme :tangle no
+;; Available primitives
+(define synchronization-primitives
+  '((channels . "CSP-style communication")
+    (atomic-boxes . "Lock-free shared state")
+    (promises . "Deferred computation")
+    (conditions . "Event notification")))
+#+END_SRC
+
+* Storage Architecture
+
+** Content-Addressable Storage
+
+#+BEGIN_SRC mermaid :file storage-design.png :exports results
+graph LR
+    subgraph "Write Path"
+        D1[Data] --> H1[Hash]
+        H1 --> C1[Compress]
+        C1 --> E1[Encrypt]
+        E1 --> S1[(Storage)]
+    end
+    
+    subgraph "Read Path"
+        K1[Key] --> S2[(Storage)]
+        S2 --> D2[Decrypt]
+        D2 --> DC1[Decompress]
+        DC1 --> V1[Verify Hash]
+        V1 --> D3[Data]
+    end
+    
+    style D1 fill:#9f9,stroke:#333
+    style D3 fill:#9f9,stroke:#333
+    style S1 fill:#99f,stroke:#333
+    style S2 fill:#99f,stroke:#333
+#+END_SRC
+
+** Write-Ahead Logging
+
+All state changes are logged before application:
+
+1. Write intent to WAL
+2. Apply change to in-memory state
+3. Asynchronously flush to persistent storage
+4. Compact WAL periodically
+
+* Network Protocol
+
+** Message Format
+
+We use a custom binary protocol optimized for low latency:
+
+#+BEGIN_SRC text
++--------+--------+--------+--------+
+| Magic  | Version| Type   | Length |  4 bytes
++--------+--------+--------+--------+
+| Message ID (UUID)                 | 16 bytes
++-----------------------------------+
+| Timestamp (microseconds)          |  8 bytes
++-----------------------------------+
+| Payload (MessagePack)             |  N bytes
++-----------------------------------+
+| CRC32                             |  4 bytes
++-----------------------------------+
+#+END_SRC
+
+** Protocol State Machine
+
+#+BEGIN_SRC mermaid :file protocol-fsm.png :exports results
+stateDiagram-v2
+    [*] --> Disconnected
+    Disconnected --> Connecting: connect()
+    Connecting --> Handshake: tcp_established
+    Handshake --> Authenticated: auth_success
+    Handshake --> Disconnected: auth_failure
+    Authenticated --> Ready: negotiation_complete
+    Ready --> Sending: send_message
+    Sending --> Ready: ack_received
+    Ready --> Receiving: message_arrived
+    Receiving --> Ready: message_processed
+    Ready --> Disconnecting: close()
+    Disconnecting --> Disconnected: closed
+    Disconnected --> [*]
+#+END_SRC
+
+* Performance Considerations
+
+** Optimization Strategies
+
+1. *Message Batching*: Aggregate small messages
+2. *Connection Pooling*: Reuse network connections
+3. *Lazy Evaluation*: Defer computation until needed
+4. *Memoization*: Cache frequently computed values
+5. *Load Balancing*: Distribute work evenly
+
+** Benchmarking Metrics
+
+- Message throughput (msgs/sec)
+- Task completion latency (p50, p95, p99)
+- Actor spawn time
+- Memory usage per actor
+- Network bandwidth utilization
+
+* Security Model
+
+** Authentication & Authorization
+
+#+BEGIN_SRC mermaid :file auth-flow.png :exports results
+sequenceDiagram
+    participant Client
+    participant Auth
+    participant Orchestrator
+    participant Audit
+    
+    Client->>Auth: authenticate(credentials)
+    Auth->>Auth: verify_credentials
+    Auth-->>Client: auth_token
+    
+    Client->>Orchestrator: request(token, action)
+    Orchestrator->>Auth: validate_token(token)
+    Auth-->>Orchestrator: permissions
+    
+    Orchestrator->>Orchestrator: check_permission(action)
+    Orchestrator->>Audit: log(client, action)
+    
+    alt Authorized
+        Orchestrator->>Client: execute(action)
+    else Unauthorized
+        Orchestrator->>Client: deny(reason)
+    end
+#+END_SRC
+
+** Encryption
+
+- TLS 1.3 for network communication
+- AES-256-GCM for data at rest
+- Ed25519 for digital signatures
+- Argon2id for password hashing
+
+* FreeBSD Integration
+
+** kqueue Event Notification
+
+Leverage FreeBSD's kqueue for efficient event handling:
+
+#+BEGIN_SRC scheme :tangle no
+(define (kqueue-integration)
+  '((file-events . "Monitor file changes")
+    (socket-events . "Network I/O readiness")
+    (process-events . "Child process status")
+    (timer-events . "Precise scheduling")
+    (user-events . "Custom notifications")))
+#+END_SRC
+
+** Jail Support
+
+Run actors in isolated jails for security:
+
+#+BEGIN_SRC text
+/usr/local/orchestrator/
+├── jails/
+│   ├── actor-001/
+│   │   ├── etc/
+│   │   ├── usr/
+│   │   └── var/
+│   └── actor-002/
+└── shared/
+    └── libs/
+#+END_SRC
+
+** ZFS Integration
+
+- Snapshot task state before execution
+- Clone datasets for actor isolation
+- Compression for storage efficiency
+- Send/receive for replication
+
+* Future Enhancements
+
+** Planned Features
+
+1. *GraphQL API*: Modern query interface
+2. *WebAssembly Support*: Run WASM actors
+3. *Distributed Tracing*: OpenTelemetry integration
+4. *Machine Learning*: Predictive task scheduling
+5. *Kubernetes Operator*: Cloud-native deployment
+
+** Research Areas
+
+- Formal verification of actor protocols
+- Quantum-resistant cryptography
+- Byzantine fault tolerance
+- Edge computing optimization
+- Real-time stream processing
