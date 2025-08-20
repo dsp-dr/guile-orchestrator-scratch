@@ -1,0 +1,685 @@
+#+TITLE: State Machine and Storage Implementation
+#+PROPERTY: header-args:scheme :mkdirp t
+#+PROPERTY: header-args :exports code :noweb yes
+
+* State Machine Engine
+:PROPERTIES:
+:header-args:scheme: :tangle ../src/orchestrator/state-machine.scm
+:END:
+
+** Module Definition
+
+#+BEGIN_SRC scheme
+(define-module (orchestrator state-machine)
+  #:use-module (ice-9 match)
+  #:use-module (ice-9 hash-table)
+  #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-9)
+  #:use-module (srfi srfi-9 gnu)
+  #:use-module (srfi srfi-19)
+  #:export (make-state-machine
+            state-machine?
+            state-machine-id
+            state-machine-current-state
+            
+            ;; Definition
+            define-state
+            define-transition
+            define-guard
+            define-action
+            
+            ;; Execution
+            state-machine-start!
+            state-machine-trigger!
+            state-machine-reset!
+            state-machine-history
+            
+            ;; Persistence
+            state-machine-snapshot
+            state-machine-restore!))
+#+END_SRC
+
+** State Machine Types
+
+#+BEGIN_SRC scheme
+(define-record-type <state-machine>
+  (%make-state-machine id states transitions current-state 
+                      history guards actions context)
+  state-machine?
+  (id state-machine-id)
+  (states state-machine-states set-state-machine-states!)
+  (transitions state-machine-transitions set-state-machine-transitions!)
+  (current-state state-machine-current-state set-state-machine-current-state!)
+  (history state-machine-history set-state-machine-history!)
+  (guards state-machine-guards set-state-machine-guards!)
+  (actions state-machine-actions set-state-machine-actions!)
+  (context state-machine-context set-state-machine-context!))
+
+(define-record-type <state>
+  (%make-state name entry-action exit-action data)
+  state?
+  (name state-name)
+  (entry-action state-entry-action)
+  (exit-action state-exit-action)
+  (data state-data set-state-data!))
+
+(define-record-type <transition>
+  (%make-transition from to event guard action)
+  transition?
+  (from transition-from)
+  (to transition-to)
+  (event transition-event)
+  (guard transition-guard)
+  (action transition-action))
+
+(set-record-type-printer! <state-machine>
+  (lambda (record port)
+    (format port "#<state-machine ~a [~a]>"
+            (state-machine-id record)
+            (state-name (state-machine-current-state record)))))
+#+END_SRC
+
+** Constructor
+
+#+BEGIN_SRC scheme
+(define* (make-state-machine #:key
+                             (id (generate-sm-id))
+                             (initial-state 'init)
+                             (context '()))
+  (let ((sm (%make-state-machine id 
+                                 (make-hash-table)
+                                 (make-hash-table)
+                                 #f
+                                 '()
+                                 (make-hash-table)
+                                 (make-hash-table)
+                                 context)))
+    ;; Add initial state
+    (define-state sm initial-state)
+    (set-state-machine-current-state! sm 
+                                      (hash-ref (state-machine-states sm) 
+                                               initial-state))
+    sm))
+
+(define (generate-sm-id)
+  (format #f "sm-~a" (random 100000)))
+#+END_SRC
+
+** State Definition
+
+#+BEGIN_SRC scheme
+(define* (define-state sm name #:key entry exit (data '()))
+  (let ((state (%make-state name entry exit data)))
+    (hash-set! (state-machine-states sm) name state)
+    state))
+
+(define* (define-transition sm from to event #:key guard action)
+  (let ((transition (%make-transition from to event guard action))
+        (key (cons from event)))
+    (hash-set! (state-machine-transitions sm) key transition)
+    transition))
+
+(define (define-guard sm name predicate)
+  (hash-set! (state-machine-guards sm) name predicate))
+
+(define (define-action sm name procedure)
+  (hash-set! (state-machine-actions sm) name procedure))
+#+END_SRC
+
+** State Machine Execution
+
+#+BEGIN_SRC scheme
+(define (state-machine-start! sm)
+  (let ((current (state-machine-current-state sm)))
+    (when (state-entry-action current)
+      ((state-entry-action current) sm))
+    (add-history! sm 'started current)))
+
+(define (state-machine-trigger! sm event . args)
+  (let* ((current (state-machine-current-state sm))
+         (key (cons (state-name current) event))
+         (transition (hash-ref (state-machine-transitions sm) key #f)))
+    
+    (if transition
+        (if (check-guard sm transition args)
+            (perform-transition! sm transition args)
+            (begin
+              (format #t "Guard failed for transition ~a -> ~a~%"
+                      (transition-from transition)
+                      (transition-to transition))
+              #f))
+        (begin
+          (format #t "No transition from ~a on event ~a~%"
+                    (state-name current) event)
+          #f))))
+
+(define (perform-transition! sm transition args)
+  (let* ((current (state-machine-current-state sm))
+         (target-name (transition-to transition))
+         (target (hash-ref (state-machine-states sm) target-name)))
+    
+    ;; Execute exit action
+    (when (state-exit-action current)
+      ((state-exit-action current) sm))
+    
+    ;; Execute transition action
+    (when (transition-action transition)
+      (apply (transition-action transition) sm args))
+    
+    ;; Change state
+    (set-state-machine-current-state! sm target)
+    
+    ;; Execute entry action
+    (when (state-entry-action target)
+      ((state-entry-action target) sm))
+    
+    ;; Record history
+    (add-history! sm event target)
+    
+    #t))
+
+(define (check-guard sm transition args)
+  (let ((guard (transition-guard transition)))
+    (if guard
+        (apply guard sm args)
+        #t)))
+
+(define (state-machine-reset! sm)
+  (let ((initial (car (hash-map->list cons (state-machine-states sm)))))
+    (set-state-machine-current-state! sm (cdr initial))
+    (set-state-machine-history! sm '())
+    (set-state-machine-context! sm '())))
+#+END_SRC
+
+** History Management
+
+#+BEGIN_SRC scheme
+(define (add-history! sm event state)
+  (let ((entry `((timestamp . ,(current-time))
+                 (event . ,event)
+                 (state . ,(state-name state)))))
+    (set-state-machine-history! sm
+                                (cons entry (state-machine-history sm)))))
+
+(define (state-machine-snapshot sm)
+  `((id . ,(state-machine-id sm))
+    (current-state . ,(state-name (state-machine-current-state sm)))
+    (context . ,(state-machine-context sm))
+    (history . ,(take (state-machine-history sm) 
+                     (min 100 (length (state-machine-history sm)))))))
+
+(define (state-machine-restore! sm snapshot)
+  (let ((state-name (assq-ref snapshot 'current-state))
+        (context (assq-ref snapshot 'context))
+        (history (assq-ref snapshot 'history)))
+    (set-state-machine-current-state! 
+     sm (hash-ref (state-machine-states sm) state-name))
+    (set-state-machine-context! sm context)
+    (set-state-machine-history! sm history)))
+#+END_SRC
+
+* Content-Addressable Storage
+:PROPERTIES:
+:header-args:scheme: :tangle ../src/orchestrator/storage.scm
+:END:
+
+** Module Definition
+
+#+BEGIN_SRC scheme
+(define-module (orchestrator storage)
+  #:use-module (ice-9 hash-table)
+  #:use-module (ice-9 binary-ports)
+  #:use-module (ice-9 textual-ports)
+  #:use-module (ice-9 iconv)
+  #:use-module (rnrs bytevectors)
+  #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-9)
+  #:use-module (srfi srfi-19)
+  #:use-module (gcrypt hash)
+  #:export (make-storage
+            storage?
+            
+            ;; Core operations
+            storage-put!
+            storage-get
+            storage-delete!
+            storage-exists?
+            
+            ;; Batch operations
+            storage-put-batch!
+            storage-get-batch
+            
+            ;; Metadata
+            storage-size
+            storage-count
+            storage-list-keys
+            
+            ;; Persistence
+            storage-sync!
+            storage-compact!
+            storage-snapshot
+            storage-restore!))
+#+END_SRC
+
+** Storage Types
+
+#+BEGIN_SRC scheme
+(define-record-type <storage>
+  (%make-storage id backend index metadata wal config)
+  storage?
+  (id storage-id)
+  (backend storage-backend)
+  (index storage-index)
+  (metadata storage-metadata)
+  (wal storage-wal)
+  (config storage-config))
+
+(define-record-type <storage-entry>
+  (%make-storage-entry key value hash timestamp size)
+  storage-entry?
+  (key entry-key)
+  (value entry-value)
+  (hash entry-hash)
+  (timestamp entry-timestamp)
+  (size entry-size))
+
+(define-record-type <write-ahead-log>
+  (%make-wal path file entries)
+  wal?
+  (path wal-path)
+  (file wal-file set-wal-file!)
+  (entries wal-entries set-wal-entries!))
+#+END_SRC
+
+** Constructor
+
+#+BEGIN_SRC scheme
+(define* (make-storage #:key
+                      (id (generate-storage-id))
+                      (backend 'memory)
+                      (path "/tmp/orchestrator-storage")
+                      (compression #t)
+                      (encryption #f))
+  (let ((storage (%make-storage id
+                                (make-backend backend path)
+                                (make-hash-table)
+                                (make-hash-table)
+                                (make-wal path)
+                                `((compression . ,compression)
+                                  (encryption . ,encryption)
+                                  (path . ,path)))))
+    (initialize-storage! storage)
+    storage))
+
+(define (generate-storage-id)
+  (format #f "storage-~a" (random 100000)))
+
+(define (make-backend type path)
+  (case type
+    ((memory) (make-hash-table))
+    ((disk) (open-disk-backend path))
+    (else (error "Unknown backend type" type))))
+
+(define (open-disk-backend path)
+  ;; Create directory if it doesn't exist
+  (unless (file-exists? path)
+    (mkdir path))
+  `((type . disk)
+    (path . ,path)))
+
+(define (make-wal path)
+  (let ((wal-path (string-append path "/wal.log")))
+    (%make-wal wal-path #f '())))
+
+(define (initialize-storage! storage)
+  ;; Open WAL file
+  (let ((wal (storage-wal storage)))
+    (when (file-exists? (wal-path wal))
+      (replay-wal! storage))))
+#+END_SRC
+
+** Core Operations
+
+#+BEGIN_SRC scheme
+(define (storage-put! storage key value)
+  (let* ((serialized (serialize-value value))
+         (hash (compute-hash serialized))
+         (entry (%make-storage-entry key value hash (current-time) 
+                                    (bytevector-length serialized))))
+    
+    ;; Write to WAL first
+    (write-to-wal! (storage-wal storage) 'put key value)
+    
+    ;; Store in backend
+    (if (hash-table? (storage-backend storage))
+        (hash-set! (storage-backend storage) hash serialized)
+        (write-to-disk (storage-backend storage) hash serialized))
+    
+    ;; Update index
+    (hash-set! (storage-index storage) key hash)
+    
+    ;; Update metadata
+    (hash-set! (storage-metadata storage) hash entry)
+    
+    hash))
+
+(define (storage-get storage key)
+  (let ((hash (hash-ref (storage-index storage) key #f)))
+    (if hash
+        (let ((data (if (hash-table? (storage-backend storage))
+                       (hash-ref (storage-backend storage) hash #f)
+                       (read-from-disk (storage-backend storage) hash))))
+          (and data (deserialize-value data)))
+        #f)))
+
+(define (storage-delete! storage key)
+  (let ((hash (hash-ref (storage-index storage) key #f)))
+    (when hash
+      ;; Write to WAL
+      (write-to-wal! (storage-wal storage) 'delete key #f)
+      
+      ;; Remove from backend
+      (if (hash-table? (storage-backend storage))
+          (hash-remove! (storage-backend storage) hash)
+          (delete-from-disk (storage-backend storage) hash))
+      
+      ;; Update index and metadata
+      (hash-remove! (storage-index storage) key)
+      (hash-remove! (storage-metadata storage) hash))))
+
+(define (storage-exists? storage key)
+  (hash-ref (storage-index storage) key #f))
+#+END_SRC
+
+** Batch Operations
+
+#+BEGIN_SRC scheme
+(define (storage-put-batch! storage entries)
+  (map (lambda (entry)
+         (storage-put! storage (car entry) (cdr entry)))
+       entries))
+
+(define (storage-get-batch storage keys)
+  (map (lambda (key)
+         (cons key (storage-get storage key)))
+       keys))
+#+END_SRC
+
+** Metadata Operations
+
+#+BEGIN_SRC scheme
+(define (storage-size storage)
+  (if (hash-table? (storage-backend storage))
+      (hash-fold (lambda (k v acc)
+                   (+ acc (bytevector-length v)))
+                 0
+                 (storage-backend storage))
+      (calculate-disk-size (storage-backend storage))))
+
+(define (storage-count storage)
+  (hash-count (const #t) (storage-index storage)))
+
+(define (storage-list-keys storage)
+  (hash-map->list (lambda (k v) k) (storage-index storage)))
+#+END_SRC
+
+** Persistence
+
+#+BEGIN_SRC scheme
+(define (storage-sync! storage)
+  (flush-wal! (storage-wal storage)))
+
+(define (storage-compact! storage)
+  ;; Remove orphaned entries
+  (let ((referenced-hashes (make-hash-table)))
+    ;; Collect all referenced hashes
+    (hash-for-each (lambda (k v)
+                     (hash-set! referenced-hashes v #t))
+                   (storage-index storage))
+    
+    ;; Remove unreferenced entries
+    (if (hash-table? (storage-backend storage))
+        (let ((to-remove '()))
+          (hash-for-each (lambda (k v)
+                           (unless (hash-ref referenced-hashes k #f)
+                             (set! to-remove (cons k to-remove))))
+                         (storage-backend storage))
+          (for-each (lambda (k)
+                      (hash-remove! (storage-backend storage) k))
+                    to-remove))
+        (compact-disk-storage (storage-backend storage) referenced-hashes))))
+
+(define (storage-snapshot storage)
+  `((id . ,(storage-id storage))
+    (count . ,(storage-count storage))
+    (size . ,(storage-size storage))
+    (keys . ,(storage-list-keys storage))))
+
+(define (storage-restore! storage snapshot)
+  ;; This would restore from a snapshot
+  (format #t "Restoring storage from snapshot~%"))
+#+END_SRC
+
+** Helper Functions
+
+#+BEGIN_SRC scheme
+(define (serialize-value value)
+  (string->bytevector (format #f "~s" value) "UTF-8"))
+
+(define (deserialize-value bv)
+  (call-with-input-string (bytevector->string bv "UTF-8") read))
+
+(define (compute-hash data)
+  (bytevector->base16-string 
+   (sha256 data)))
+
+(define (write-to-wal! wal op key value)
+  (let ((entry `((op . ,op)
+                 (key . ,key)
+                 (value . ,value)
+                 (timestamp . ,(current-time)))))
+    (set-wal-entries! wal (cons entry (wal-entries wal)))))
+
+(define (flush-wal! wal)
+  ;; Write WAL entries to disk
+  (when (not (null? (wal-entries wal)))
+    (call-with-output-file (wal-path wal)
+      (lambda (port)
+        (for-each (lambda (entry)
+                    (write entry port)
+                    (newline port))
+                  (reverse (wal-entries wal)))))
+    (set-wal-entries! wal '())))
+
+(define (replay-wal! storage)
+  ;; Replay WAL entries on startup
+  (let ((wal (storage-wal storage)))
+    (when (file-exists? (wal-path wal))
+      (call-with-input-file (wal-path wal)
+        (lambda (port)
+          (let loop ()
+            (let ((entry (read port)))
+              (unless (eof-object? entry)
+                (case (assq-ref entry 'op)
+                  ((put) (storage-put! storage 
+                                      (assq-ref entry 'key)
+                                      (assq-ref entry 'value)))
+                  ((delete) (storage-delete! storage 
+                                           (assq-ref entry 'key))))
+                (loop)))))))))
+
+;; Disk operations
+(define (write-to-disk backend hash data)
+  (let ((path (string-append (assq-ref backend 'path) "/" hash)))
+    (call-with-output-file path
+      (lambda (port)
+        (put-bytevector port data)))))
+
+(define (read-from-disk backend hash)
+  (let ((path (string-append (assq-ref backend 'path) "/" hash)))
+    (if (file-exists? path)
+        (call-with-input-file path
+          (lambda (port)
+            (get-bytevector-all port)))
+        #f)))
+
+(define (delete-from-disk backend hash)
+  (let ((path (string-append (assq-ref backend 'path) "/" hash)))
+    (when (file-exists? path)
+      (delete-file path))))
+
+(define (calculate-disk-size backend)
+  ;; Calculate total size of disk storage
+  0)
+
+(define (compact-disk-storage backend referenced)
+  ;; Compact disk storage by removing unreferenced files
+  #f)
+
+;; Stub for sha256 if gcrypt not available
+(define (sha256 data)
+  ;; This is a stub - real implementation would use gcrypt
+  (let ((sum (fold + 0 (bytevector->u8-list data))))
+    (u8-list->bytevector 
+     (map (lambda (i) (modulo (+ sum i) 256)) (iota 32)))))
+
+(define (bytevector->base16-string bv)
+  (string-concatenate
+   (map (lambda (byte)
+          (format #f "~2,'0x" byte))
+        (bytevector->u8-list bv))))
+#+END_SRC
+
+* Event Sourcing
+:PROPERTIES:
+:header-args:scheme: :tangle ../src/orchestrator/events.scm
+:END:
+
+** Module Definition
+
+#+BEGIN_SRC scheme
+(define-module (orchestrator events)
+  #:use-module (ice-9 match)
+  #:use-module (ice-9 hash-table)
+  #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-9)
+  #:use-module (srfi srfi-19)
+  #:export (make-event-store
+            event-store?
+            
+            ;; Event operations
+            append-event!
+            get-events
+            get-events-since
+            
+            ;; Event types
+            make-event
+            event?
+            event-id
+            event-type
+            event-aggregate-id
+            event-data
+            event-timestamp
+            
+            ;; Projections
+            create-projection
+            update-projection!
+            get-projection-state
+            
+            ;; Snapshots
+            create-snapshot
+            get-latest-snapshot))
+#+END_SRC
+
+** Event Types
+
+#+BEGIN_SRC scheme
+(define-record-type <event>
+  (%make-event id type aggregate-id data timestamp version)
+  event?
+  (id event-id)
+  (type event-type)
+  (aggregate-id event-aggregate-id)
+  (data event-data)
+  (timestamp event-timestamp)
+  (version event-version))
+
+(define-record-type <event-store>
+  (%make-event-store events projections snapshots)
+  event-store?
+  (events store-events set-store-events!)
+  (projections store-projections)
+  (snapshots store-snapshots))
+
+(define-record-type <projection>
+  (%make-projection id handler state)
+  projection?
+  (id projection-id)
+  (handler projection-handler)
+  (state projection-state set-projection-state!))
+#+END_SRC
+
+** Event Store Operations
+
+#+BEGIN_SRC scheme
+(define (make-event-store)
+  (%make-event-store '() (make-hash-table) (make-hash-table)))
+
+(define* (make-event type aggregate-id data #:key (version 1))
+  (%make-event (generate-event-id) type aggregate-id data 
+              (current-time) version))
+
+(define (generate-event-id)
+  (format #f "evt-~a-~a" (time-second (current-time)) (random 10000)))
+
+(define (append-event! store event)
+  (set-store-events! store (append (store-events store) (list event)))
+  
+  ;; Update projections
+  (hash-for-each (lambda (id projection)
+                   (update-projection! projection event))
+                 (store-projections store))
+  
+  event)
+
+(define (get-events store aggregate-id)
+  (filter (lambda (e) (equal? (event-aggregate-id e) aggregate-id))
+          (store-events store)))
+
+(define (get-events-since store timestamp)
+  (filter (lambda (e) (time>? (event-timestamp e) timestamp))
+          (store-events store)))
+#+END_SRC
+
+** Projections
+
+#+BEGIN_SRC scheme
+(define* (create-projection id handler #:key (initial-state '()))
+  (%make-projection id handler initial-state))
+
+(define (update-projection! projection event)
+  (let ((new-state ((projection-handler projection) 
+                   (projection-state projection) 
+                   event)))
+    (set-projection-state! projection new-state)))
+
+(define (get-projection-state projection)
+  (projection-state projection))
+#+END_SRC
+
+** Snapshots
+
+#+BEGIN_SRC scheme
+(define (create-snapshot store aggregate-id)
+  (let ((events (get-events store aggregate-id)))
+    (when (not (null? events))
+      (let ((snapshot `((aggregate-id . ,aggregate-id)
+                       (event-count . ,(length events))
+                       (timestamp . ,(current-time))
+                       (last-event . ,(event-id (last events))))))
+        (hash-set! (store-snapshots store) aggregate-id snapshot)
+        snapshot))))
+
+(define (get-latest-snapshot store aggregate-id)
+  (hash-ref (store-snapshots store) aggregate-id #f))
+#+END_SRC

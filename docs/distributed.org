@@ -1,0 +1,742 @@
+#+TITLE: Distributed Coordination and Worker Pool
+#+PROPERTY: header-args:scheme :mkdirp t
+#+PROPERTY: header-args :exports code :noweb yes
+
+* Distributed Coordination
+:PROPERTIES:
+:header-args:scheme: :tangle ../src/orchestrator/coordination.scm
+:END:
+
+** Module Definition
+
+#+BEGIN_SRC scheme
+(define-module (orchestrator coordination)
+  #:use-module (ice-9 match)
+  #:use-module (ice-9 threads)
+  #:use-module (ice-9 atomic)
+  #:use-module (ice-9 hash-table)
+  #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-9)
+  #:use-module (srfi srfi-19)
+  #:use-module (srfi srfi-43)
+  #:export (;; Coordinator
+            make-coordinator
+            coordinator?
+            coordinator-join!
+            coordinator-leave!
+            coordinator-elect-leader
+            coordinator-get-leader
+            
+            ;; Consensus
+            propose-value
+            get-consensus
+            
+            ;; Distributed Lock
+            acquire-lock
+            release-lock
+            with-distributed-lock
+            
+            ;; Membership
+            get-members
+            is-member?
+            member-heartbeat!
+            
+            ;; Vector Clock
+            make-vector-clock
+            vector-clock-increment!
+            vector-clock-compare
+            vector-clock-merge!))
+#+END_SRC
+
+** Coordinator Types
+
+#+BEGIN_SRC scheme
+(define-record-type <coordinator>
+  (%make-coordinator node-id members leader election-term 
+                    locks consensus-log vector-clocks)
+  coordinator?
+  (node-id coordinator-node-id)
+  (members coordinator-members set-coordinator-members!)
+  (leader coordinator-leader set-coordinator-leader!)
+  (election-term coordinator-election-term set-coordinator-election-term!)
+  (locks coordinator-locks)
+  (consensus-log coordinator-consensus-log set-coordinator-consensus-log!)
+  (vector-clocks coordinator-vector-clocks))
+
+(define-record-type <member>
+  (%make-member id address last-heartbeat status metadata)
+  member?
+  (id member-id)
+  (address member-address)
+  (last-heartbeat member-last-heartbeat set-member-last-heartbeat!)
+  (status member-status set-member-status!)
+  (metadata member-metadata))
+
+(define-record-type <distributed-lock>
+  (%make-distributed-lock resource holder acquired-at ttl)
+  distributed-lock?
+  (resource lock-resource)
+  (holder lock-holder set-lock-holder!)
+  (acquired-at lock-acquired-at set-lock-acquired-at!)
+  (ttl lock-ttl))
+#+END_SRC
+
+** Constructor
+
+#+BEGIN_SRC scheme
+(define* (make-coordinator #:key 
+                          (node-id (generate-node-id))
+                          (address "localhost:8080"))
+  (let ((coordinator (%make-coordinator 
+                     node-id
+                     (make-hash-table)
+                     #f
+                     0
+                     (make-hash-table)
+                     '()
+                     (make-hash-table))))
+    ;; Register self as member
+    (coordinator-join! coordinator node-id address)
+    
+    ;; Start heartbeat thread
+    (call-with-new-thread
+     (lambda ()
+       (heartbeat-loop coordinator)))
+    
+    ;; Start election timer
+    (call-with-new-thread
+     (lambda ()
+       (election-loop coordinator)))
+    
+    coordinator))
+
+(define (generate-node-id)
+  (format #f "node-~a" (random 100000)))
+#+END_SRC
+
+** Membership Management
+
+#+BEGIN_SRC scheme
+(define* (coordinator-join! coord node-id address #:key (metadata '()))
+  (let ((member (%make-member node-id address (current-time) 
+                              'active metadata)))
+    (hash-set! (coordinator-members coord) node-id member)
+    
+    ;; Initialize vector clock for new member
+    (hash-set! (coordinator-vector-clocks coord) node-id 0)
+    
+    ;; Trigger leader election if no leader
+    (unless (coordinator-leader coord)
+      (start-election! coord))
+    
+    member))
+
+(define (coordinator-leave! coord node-id)
+  (hash-remove! (coordinator-members coord) node-id)
+  (hash-remove! (coordinator-vector-clocks coord) node-id)
+  
+  ;; If leaving node was leader, trigger new election
+  (when (and (coordinator-leader coord)
+             (equal? (member-id (coordinator-leader coord)) node-id))
+    (set-coordinator-leader! coord #f)
+    (start-election! coord)))
+
+(define (get-members coord)
+  (hash-map->list (lambda (k v) v) (coordinator-members coord)))
+
+(define (is-member? coord node-id)
+  (hash-ref (coordinator-members coord) node-id #f))
+
+(define (member-heartbeat! coord node-id)
+  (let ((member (hash-ref (coordinator-members coord) node-id #f)))
+    (when member
+      (set-member-last-heartbeat! member (current-time))
+      (set-member-status! member 'active))))
+#+END_SRC
+
+** Leader Election (Simplified Raft)
+
+#+BEGIN_SRC scheme
+(define (start-election! coord)
+  (let ((new-term (+ 1 (coordinator-election-term coord))))
+    (set-coordinator-election-term! coord new-term)
+    
+    ;; Vote for self
+    (let ((votes (make-hash-table)))
+      (hash-set! votes (coordinator-node-id coord) #t)
+      
+      ;; Request votes from other members
+      (let ((members (get-active-members coord)))
+        (for-each (lambda (member)
+                    (unless (equal? (member-id member) 
+                                  (coordinator-node-id coord))
+                      ;; Simulate vote (in real implementation, send RPC)
+                      (when (> (random 100) 30) ; 70% chance of vote
+                        (hash-set! votes (member-id member) #t))))
+                  members))
+      
+      ;; Check if won election (majority)
+      (let ((vote-count (hash-count (const #t) votes))
+            (majority (/ (+ 1 (length members)) 2)))
+        (when (> vote-count majority)
+          (become-leader! coord))))))
+
+(define (become-leader! coord)
+  (let ((self (hash-ref (coordinator-members coord) 
+                       (coordinator-node-id coord))))
+    (set-coordinator-leader! coord self)
+    (format #t "Node ~a became leader for term ~a~%"
+            (coordinator-node-id coord)
+            (coordinator-election-term coord))))
+
+(define (coordinator-elect-leader coord)
+  (start-election! coord))
+
+(define (coordinator-get-leader coord)
+  (coordinator-leader coord))
+
+(define (get-active-members coord)
+  (filter (lambda (m) (eq? (member-status m) 'active))
+          (get-members coord)))
+#+END_SRC
+
+** Consensus Protocol
+
+#+BEGIN_SRC scheme
+(define (propose-value coord value)
+  (if (is-leader? coord)
+      (let ((entry `((term . ,(coordinator-election-term coord))
+                     (value . ,value)
+                     (timestamp . ,(current-time))
+                     (committed . #f))))
+        ;; Append to log
+        (set-coordinator-consensus-log! 
+         coord 
+         (append (coordinator-consensus-log coord) (list entry)))
+        
+        ;; In real implementation, replicate to followers
+        (replicate-entry coord entry)
+        
+        ;; Mark as committed after replication
+        (commit-entry! coord entry)
+        
+        entry)
+      (error "Only leader can propose values")))
+
+(define (get-consensus coord)
+  (filter (lambda (entry) (assq-ref entry 'committed))
+          (coordinator-consensus-log coord)))
+
+(define (is-leader? coord)
+  (and (coordinator-leader coord)
+       (equal? (member-id (coordinator-leader coord))
+               (coordinator-node-id coord))))
+
+(define (replicate-entry coord entry)
+  ;; Simulate replication to followers
+  (format #t "Replicating entry to followers: ~a~%" entry))
+
+(define (commit-entry! coord entry)
+  (set! entry (assq-set! entry 'committed #t)))
+#+END_SRC
+
+** Distributed Locking
+
+#+BEGIN_SRC scheme
+(define* (acquire-lock coord resource #:key 
+                      (timeout 30)
+                      (ttl 60))
+  (let ((locks (coordinator-locks coord))
+        (node-id (coordinator-node-id coord)))
+    
+    ;; Check if lock is available
+    (let ((existing-lock (hash-ref locks resource #f)))
+      (if (and existing-lock
+               (not (lock-expired? existing-lock)))
+          #f ; Lock held by another node
+          (let ((lock (%make-distributed-lock resource node-id 
+                                             (current-time) ttl)))
+            (hash-set! locks resource lock)
+            lock)))))
+
+(define (release-lock coord resource)
+  (let ((locks (coordinator-locks coord))
+        (node-id (coordinator-node-id coord)))
+    
+    (let ((lock (hash-ref locks resource #f)))
+      (when (and lock
+                 (equal? (lock-holder lock) node-id))
+        (hash-remove! locks resource)
+        #t))))
+
+(define (with-distributed-lock coord resource thunk)
+  (let ((lock (acquire-lock coord resource)))
+    (if lock
+        (dynamic-wind
+          (lambda () #f)
+          thunk
+          (lambda () (release-lock coord resource)))
+        (error "Failed to acquire lock" resource))))
+
+(define (lock-expired? lock)
+  (let ((elapsed (time-difference (current-time) 
+                                 (lock-acquired-at lock))))
+    (> (time-second elapsed) (lock-ttl lock))))
+#+END_SRC
+
+** Vector Clocks
+
+#+BEGIN_SRC scheme
+(define (make-vector-clock nodes)
+  (let ((clock (make-hash-table)))
+    (for-each (lambda (node) (hash-set! clock node 0)) nodes)
+    clock))
+
+(define (vector-clock-increment! coord node-id)
+  (let ((clocks (coordinator-vector-clocks coord)))
+    (hash-set! clocks node-id 
+              (+ 1 (hash-ref clocks node-id 0)))))
+
+(define (vector-clock-compare clock1 clock2)
+  ;; Returns: 'before, 'after, 'concurrent, or 'equal
+  (let ((keys (delete-duplicates 
+               (append (hash-map->list (lambda (k v) k) clock1)
+                      (hash-map->list (lambda (k v) k) clock2)))))
+    (let loop ((keys keys)
+               (less 0)
+               (greater 0))
+      (if (null? keys)
+          (cond
+           ((and (= less 0) (= greater 0)) 'equal)
+           ((and (> less 0) (= greater 0)) 'before)
+           ((and (= less 0) (> greater 0)) 'after)
+           (else 'concurrent))
+          (let* ((key (car keys))
+                 (v1 (hash-ref clock1 key 0))
+                 (v2 (hash-ref clock2 key 0)))
+            (loop (cdr keys)
+                  (if (< v1 v2) (+ less 1) less)
+                  (if (> v1 v2) (+ greater 1) greater)))))))
+
+(define (vector-clock-merge! clock1 clock2)
+  ;; Merge clock2 into clock1, taking max of each component
+  (hash-for-each (lambda (k v)
+                   (hash-set! clock1 k 
+                             (max v (hash-ref clock1 k 0))))
+                 clock2))
+#+END_SRC
+
+** Background Loops
+
+#+BEGIN_SRC scheme
+(define (heartbeat-loop coord)
+  (let loop ()
+    (sleep 5) ; Send heartbeat every 5 seconds
+    
+    ;; Send heartbeat (in real implementation, network call)
+    (member-heartbeat! coord (coordinator-node-id coord))
+    
+    ;; Check for failed members
+    (check-member-health coord)
+    
+    (loop)))
+
+(define (election-loop coord)
+  (let loop ()
+    (sleep (+ 10 (random 10))) ; Random election timeout
+    
+    ;; Start election if no leader and timeout
+    (unless (coordinator-leader coord)
+      (start-election! coord))
+    
+    (loop)))
+
+(define (check-member-health coord)
+  (let ((timeout-seconds 15)
+        (current (current-time)))
+    (hash-for-each 
+     (lambda (id member)
+       (let ((elapsed (time-difference current 
+                                      (member-last-heartbeat member))))
+         (when (> (time-second elapsed) timeout-seconds)
+           (set-member-status! member 'failed))))
+     (coordinator-members coord))))
+#+END_SRC
+
+* Worker Pool Management
+:PROPERTIES:
+:header-args:scheme: :tangle ../src/orchestrator/worker-pool.scm
+:END:
+
+** Module Definition
+
+#+BEGIN_SRC scheme
+(define-module (orchestrator worker-pool)
+  #:use-module (ice-9 match)
+  #:use-module (ice-9 threads)
+  #:use-module (ice-9 atomic)
+  #:use-module (ice-9 q)
+  #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-9)
+  #:use-module (srfi srfi-19)
+  #:export (make-worker-pool
+            worker-pool?
+            
+            ;; Pool management
+            worker-pool-start!
+            worker-pool-stop!
+            worker-pool-resize!
+            
+            ;; Task submission
+            submit-work
+            submit-work-async
+            
+            ;; Monitoring
+            worker-pool-stats
+            worker-pool-active-count
+            worker-pool-queue-size
+            
+            ;; Worker control
+            pause-worker
+            resume-worker
+            worker-stats))
+#+END_SRC
+
+** Worker Pool Types
+
+#+BEGIN_SRC scheme
+(define-record-type <worker-pool>
+  (%make-worker-pool id size workers queue config stats)
+  worker-pool?
+  (id pool-id)
+  (size pool-size set-pool-size!)
+  (workers pool-workers set-pool-workers!)
+  (queue pool-queue)
+  (config pool-config)
+  (stats pool-stats))
+
+(define-record-type <worker>
+  (%make-worker id thread status current-task stats)
+  worker?
+  (id worker-id)
+  (thread worker-thread set-worker-thread!)
+  (status worker-status set-worker-status!)
+  (current-task worker-current-task set-worker-current-task!)
+  (stats worker-stats))
+
+(define-record-type <worker-stats>
+  (%make-worker-stats tasks-completed tasks-failed total-time idle-time)
+  worker-stats?
+  (tasks-completed stats-tasks-completed set-stats-tasks-completed!)
+  (tasks-failed stats-tasks-failed set-stats-tasks-failed!)
+  (total-time stats-total-time set-stats-total-time!)
+  (idle-time stats-idle-time set-stats-idle-time!))
+
+(define-record-type <work-item>
+  (%make-work-item id task callback priority submitted-at)
+  work-item?
+  (id work-id)
+  (task work-task)
+  (callback work-callback)
+  (priority work-priority)
+  (submitted-at work-submitted-at))
+#+END_SRC
+
+** Constructor
+
+#+BEGIN_SRC scheme
+(define* (make-worker-pool #:key
+                          (size 4)
+                          (max-queue-size 1000)
+                          (idle-timeout 60))
+  (let ((pool (%make-worker-pool
+               (generate-pool-id)
+               size
+               '()
+               (make-q)
+               `((max-queue-size . ,max-queue-size)
+                 (idle-timeout . ,idle-timeout))
+               (make-atomic-box (make-pool-stats)))))
+    pool))
+
+(define (generate-pool-id)
+  (format #f "pool-~a" (random 100000)))
+
+(define (make-pool-stats)
+  `((total-submitted . 0)
+    (total-completed . 0)
+    (total-failed . 0)
+    (average-wait-time . 0)
+    (average-execution-time . 0)))
+#+END_SRC
+
+** Pool Lifecycle
+
+#+BEGIN_SRC scheme
+(define (worker-pool-start! pool)
+  (let ((size (pool-size pool)))
+    (set-pool-workers! 
+     pool
+     (map (lambda (i)
+            (create-worker pool i))
+          (iota size)))
+    
+    ;; Start monitor thread
+    (call-with-new-thread
+     (lambda ()
+       (pool-monitor-loop pool)))
+    
+    pool))
+
+(define (worker-pool-stop! pool)
+  ;; Signal all workers to stop
+  (for-each (lambda (worker)
+              (set-worker-status! worker 'stopping))
+            (pool-workers pool))
+  
+  ;; Wait for workers to finish
+  (for-each (lambda (worker)
+              (join-thread (worker-thread worker)))
+            (pool-workers pool))
+  
+  ;; Clear the queue
+  (while (not (q-empty? (pool-queue pool)))
+    (deq! (pool-queue pool))))
+
+(define (worker-pool-resize! pool new-size)
+  (let ((current-size (pool-size pool)))
+    (cond
+     ((> new-size current-size)
+      ;; Add workers
+      (let ((new-workers 
+             (map (lambda (i)
+                    (create-worker pool (+ current-size i)))
+                  (iota (- new-size current-size)))))
+        (set-pool-workers! pool 
+                          (append (pool-workers pool) new-workers))))
+     ((< new-size current-size)
+      ;; Remove workers
+      (let ((to-remove (- current-size new-size)))
+        (for-each (lambda (worker)
+                    (set-worker-status! worker 'stopping))
+                  (take (pool-workers pool) to-remove))
+        (set-pool-workers! pool 
+                          (drop (pool-workers pool) to-remove)))))
+    (set-pool-size! pool new-size)))
+#+END_SRC
+
+** Worker Implementation
+
+#+BEGIN_SRC scheme
+(define (create-worker pool index)
+  (let* ((worker-id (format #f "worker-~a-~a" (pool-id pool) index))
+         (stats (%make-worker-stats 0 0 0 0))
+         (worker (%make-worker worker-id #f 'idle #f stats)))
+    
+    ;; Start worker thread
+    (set-worker-thread! 
+     worker
+     (call-with-new-thread
+      (lambda ()
+        (worker-loop pool worker))))
+    
+    worker))
+
+(define (worker-loop pool worker)
+  (let loop ()
+    (case (worker-status worker)
+      ((stopping) #f) ; Exit loop
+      
+      ((paused)
+       (sleep 1)
+       (loop))
+      
+      (else
+       ;; Get work from queue
+       (let ((work-item (get-work pool)))
+         (if work-item
+             (begin
+               (execute-work worker work-item)
+               (loop))
+             (begin
+               ;; No work available, idle
+               (set-worker-status! worker 'idle)
+               (sleep 0.1)
+               (loop))))))))
+
+(define (get-work pool)
+  (if (q-empty? (pool-queue pool))
+      #f
+      (deq! (pool-queue pool))))
+
+(define (execute-work worker work-item)
+  (set-worker-status! worker 'busy)
+  (set-worker-current-task! worker work-item)
+  
+  (let ((start-time (current-time))
+        (task (work-task work-item))
+        (callback (work-callback work-item)))
+    
+    (with-exception-handler
+     (lambda (exn)
+       ;; Handle task failure
+       (update-worker-stats! worker #f start-time)
+       (when callback
+         (callback #f exn)))
+     (lambda ()
+       ;; Execute task
+       (let ((result (task)))
+         (update-worker-stats! worker #t start-time)
+         (when callback
+           (callback result #f))))
+     #:unwind? #t))
+  
+  (set-worker-current-task! worker #f)
+  (set-worker-status! worker 'idle))
+
+(define (update-worker-stats! worker success? start-time)
+  (let ((stats (worker-stats worker))
+        (elapsed (time-difference (current-time) start-time)))
+    (if success?
+        (set-stats-tasks-completed! stats 
+                                   (+ 1 (stats-tasks-completed stats)))
+        (set-stats-tasks-failed! stats 
+                                (+ 1 (stats-tasks-failed stats))))
+    (set-stats-total-time! stats
+                          (+ (time-second elapsed) 
+                             (stats-total-time stats)))))
+#+END_SRC
+
+** Task Submission
+
+#+BEGIN_SRC scheme
+(define* (submit-work pool task #:key 
+                     (priority 0)
+                     (callback #f))
+  (let ((queue (pool-queue pool))
+        (max-size (assq-ref (pool-config pool) 'max-queue-size)))
+    
+    ;; Check queue size
+    (when (>= (q-length queue) max-size)
+      (error "Worker pool queue full"))
+    
+    (let ((work-item (%make-work-item
+                     (generate-work-id)
+                     task
+                     callback
+                     priority
+                     (current-time))))
+      
+      ;; Add to queue (priority queue would be better)
+      (enq! queue work-item)
+      
+      ;; Update stats
+      (update-pool-stats! pool 'submitted)
+      
+      (work-id work-item))))
+
+(define (submit-work-async pool task)
+  (let ((result-box (make-atomic-box #f))
+        (done-box (make-atomic-box #f)))
+    
+    (submit-work pool task
+                #:callback (lambda (result error)
+                            (atomic-box-set! result-box 
+                                           (if error
+                                               `(error . ,error)
+                                               `(ok . ,result)))
+                            (atomic-box-set! done-box #t)))
+    
+    ;; Return a future-like object
+    (lambda ()
+      (while (not (atomic-box-ref done-box))
+        (sleep 0.01))
+      (let ((result (atomic-box-ref result-box)))
+        (if (eq? (car result) 'error)
+            (error "Task failed" (cdr result))
+            (cdr result))))))
+
+(define (generate-work-id)
+  (format #f "work-~a" (random 1000000)))
+#+END_SRC
+
+** Monitoring
+
+#+BEGIN_SRC scheme
+(define (worker-pool-stats pool)
+  (let ((stats (atomic-box-ref (pool-stats pool)))
+        (workers (pool-workers pool)))
+    `((pool-id . ,(pool-id pool))
+      (size . ,(pool-size pool))
+      (queue-size . ,(q-length (pool-queue pool)))
+      (active-workers . ,(worker-pool-active-count pool))
+      (idle-workers . ,(count (lambda (w) 
+                                (eq? (worker-status w) 'idle))
+                             workers))
+      (pool-stats . ,stats)
+      (worker-stats . ,(map worker-summary workers)))))
+
+(define (worker-pool-active-count pool)
+  (count (lambda (w) (eq? (worker-status w) 'busy))
+         (pool-workers pool)))
+
+(define (worker-pool-queue-size pool)
+  (q-length (pool-queue pool)))
+
+(define (worker-summary worker)
+  (let ((stats (worker-stats worker)))
+    `((id . ,(worker-id worker))
+      (status . ,(worker-status worker))
+      (completed . ,(stats-tasks-completed stats))
+      (failed . ,(stats-tasks-failed stats)))))
+
+(define (update-pool-stats! pool event)
+  (let ((stats-box (pool-stats pool)))
+    (atomic-box-set! 
+     stats-box
+     (let ((stats (atomic-box-ref stats-box)))
+       (case event
+         ((submitted)
+          (assq-set! stats 'total-submitted
+                    (+ 1 (assq-ref stats 'total-submitted))))
+         ((completed)
+          (assq-set! stats 'total-completed
+                    (+ 1 (assq-ref stats 'total-completed))))
+         ((failed)
+          (assq-set! stats 'total-failed
+                    (+ 1 (assq-ref stats 'total-failed)))))
+       stats))))
+#+END_SRC
+
+** Worker Control
+
+#+BEGIN_SRC scheme
+(define (pause-worker pool worker-id)
+  (let ((worker (find (lambda (w) (equal? (worker-id w) worker-id))
+                     (pool-workers pool))))
+    (when worker
+      (set-worker-status! worker 'paused))))
+
+(define (resume-worker pool worker-id)
+  (let ((worker (find (lambda (w) (equal? (worker-id w) worker-id))
+                     (pool-workers pool))))
+    (when worker
+      (set-worker-status! worker 'idle))))
+
+(define (pool-monitor-loop pool)
+  ;; Monitor pool health and auto-scale if needed
+  (let loop ()
+    (sleep 10)
+    
+    ;; Check queue size and potentially scale
+    (let ((queue-size (q-length (pool-queue pool)))
+          (active-count (worker-pool-active-count pool)))
+      
+      ;; Auto-scaling logic could go here
+      (when (and (> queue-size 50)
+                 (= active-count (pool-size pool)))
+        (format #t "Pool ~a under pressure: queue=~a, active=~a~%"
+                (pool-id pool) queue-size active-count)))
+    
+    (loop)))
+#+END_SRC
