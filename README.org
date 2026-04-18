@@ -11,20 +11,24 @@
   <img src="https://img.shields.io/badge/private-repository-lightgrey.svg" alt="Private Repository">
   <img src="https://img.shields.io/badge/architecture-actor--model-brightgreen.svg" alt="Actor Model">
   <img src="https://img.shields.io/badge/lines%20of%20code-2.4k-blue.svg" alt="Lines of Code">
+  <img src="https://img.shields.io/badge/status-scratch-yellow.svg" alt="Scratch Repo">
 </p>
 #+END_EXPORT
 
 * Overview
 
-Guile Orchestrator is a distributed systems orchestration framework implemented in Guile Scheme 3.0+, designed for FreeBSD systems. This project adapts orchestration patterns from modern distributed systems literature into a functional, Scheme-based architecture leveraging Guile's powerful features including Fibers for concurrency, delimited continuations for control flow, and GOOPS for extensible component design.
+Guile Orchestrator is a distributed systems orchestration framework implemented in Guile Scheme 3.0+, originally targeting FreeBSD systems. This scratch/experimental project adapts orchestration patterns from modern distributed systems literature into a Scheme-based architecture using Guile's threading primitives, SRFI record types, and ~syntax-rules~ macros.
 
 ** Key Features
 
-- Actor-based concurrency model using Guile Fibers
-- Declarative orchestration DSL via Guile macros
-- Content-addressable task storage
-- Distributed coordination with eventual consistency
-- FreeBSD-specific optimizations (kqueue, jail integration)
+- Actor-based concurrency model using ~(ice-9 threads)~
+- ~define-actor~ macro for pattern-matching message handlers
+- Content-addressable storage with write-ahead logging
+- OTP-style supervision trees (one-for-one, one-for-all, rest-for-one)
+- Event sourcing with projections and snapshots
+- Leader election, distributed locks, and vector clocks (in-process simulation)
+- Circuit breaker and retry/timeout error handling
+- Worker pool with stats and auto-scale monitoring
 - Literate programming approach with org-mode
 
 ** Architecture Overview
@@ -80,17 +84,18 @@ graph TB
 
 ** Prerequisites
 
-- FreeBSD 14.3 or later
-- Guile 3.0.10 or later
-- GNU Make 4.4+
+- FreeBSD 14.0+ or macOS (Linux untested but CI runs Ubuntu)
+- Guile 3.0+ (~guile3~ on FreeBSD, ~guile~ elsewhere)
+- GNU Make (~gmake~ on FreeBSD)
+- Emacs (for org-mode tangling)
 - Git
 
 ** Building from Source
 
 #+BEGIN_SRC bash
 # Clone the repository
-git clone https://github.com/dsp-dr/guile-orchestrator.git
-cd guile-orchestrator
+git clone https://github.com/dsp-dr/guile-orchestrator-scratch.git
+cd guile-orchestrator-scratch
 
 # Build the project
 gmake all
@@ -156,34 +161,34 @@ gmake install PREFIX=/usr/local
 ** Pre-v1.0.0 Milestones
 
 *** v0.1.0 - Core Actor System
-- [X] Basic actor implementation with Fibers
-- [X] Message passing infrastructure
-- [X] Actor supervision tree
-- [ ] Unit tests for actor system
+- [X] Basic actor implementation (threads, not Fibers -- Fibers not yet integrated)
+- [X] Message passing infrastructure (channel primitives)
+- [X] Actor supervision tree (OTP-style supervisor)
+- [X] Unit tests for actor system
 
 *** v0.2.0 - Task Management
-- [ ] Task definition DSL
-- [ ] Task scheduling algorithms
-- [ ] Priority queue implementation
+- [X] Task definition (record types, not DSL)
+- [X] Task scheduling (basic, in core-enhanced)
+- [ ] Priority queue implementation (stub only)
 - [ ] Task persistence layer
 
 *** v0.3.0 - State Machine Engine
-- [ ] FSM implementation using delimited continuations
-- [ ] State persistence and recovery
-- [ ] Event sourcing integration
-- [ ] Snapshot mechanism
+- [X] FSM implementation (hash-table based, not delimited continuations)
+- [X] State persistence and recovery (snapshot/restore)
+- [X] Event sourcing integration (events module)
+- [X] Snapshot mechanism
 
 *** v0.4.0 - Distributed Coordination
 - [ ] Gossip protocol implementation
-- [ ] Consensus algorithm (Raft/Paxos)
-- [ ] Distributed lock service
-- [ ] Membership management
+- [X] Consensus algorithm (simplified Raft-like leader election)
+- [X] Distributed lock service (with TTL)
+- [X] Membership management (with heartbeats, vector clocks)
 
 *** v0.5.0 - Storage Layer
-- [ ] Content-addressable storage
-- [ ] Write-ahead logging
-- [ ] Compaction strategies
-- [ ] Storage benchmarks
+- [X] Content-addressable storage (memory + disk backends)
+- [X] Write-ahead logging
+- [X] Compaction strategies (orphan removal)
+- [X] Storage benchmarks (benchmarks/performance.scm)
 
 *** v0.6.0 - FreeBSD Integration
 - [ ] kqueue event integration
@@ -218,45 +223,55 @@ gmake install PREFIX=/usr/local
 * Project Structure
 
 #+BEGIN_SRC text
-guile-orchestrator/
+guile-orchestrator-scratch/
 ├── README.org                 # This file
 ├── Makefile                  # GNU Make build automation
-├── guix.scm                  # Guix package definition
 ├── .envrc                    # direnv configuration
-├── src/                      # Source code (tangled from docs/)
-│   ├── orchestrator/
-│   │   ├── core.scm         # Core orchestrator logic
-│   │   ├── actors.scm       # Actor system implementation
-│   │   ├── tasks.scm        # Task management
-│   │   ├── state.scm        # State machine engine
-│   │   ├── storage.scm      # Storage layer
-│   │   └── network.scm      # Network protocols
-│   └── main.scm             # Entry point
-├── tests/                    # Test suite
-│   ├── orchestrator/
-│   │   ├── core-test.scm
-│   │   ├── actors-test.scm
-│   │   └── tasks-test.scm
-│   └── test-runner.scm      # Test suite runner
-├── docs/                     # Literate programming source
+├── .github/workflows/ci.yml  # CI pipeline (Ubuntu + FreeBSD)
+├── src/orchestrator/
+│   ├── core.scm             # Core orchestrator + channel primitives
+│   ├── core-enhanced.scm    # Extended orchestrator (scheduler, dispatcher, monitor)
+│   ├── actors.scm           # Actor system (spawn, mailbox, define-actor macro)
+│   ├── tasks.scm            # Task records (pending/completed/failed)
+│   ├── state-machine.scm    # FSM engine (states, transitions, guards, history)
+│   ├── storage.scm          # Content-addressable store + WAL
+│   ├── events.scm           # Event sourcing (append-only log, projections, snapshots)
+│   ├── errors.scm           # Error types, retry, timeout, circuit breaker
+│   ├── supervisor.scm       # OTP-style supervision trees
+│   ├── worker-pool.scm      # Thread pool with work queue + stats
+│   ├── router.scm           # Pattern-matching message router
+│   └── coordination.scm     # Leader election, distributed locks, vector clocks
+├── tests/
+│   ├── test-runner.scm       # SRFI-64 test suite runner
+│   ├── integration-test.scm  # Integration tests
+│   └── orchestrator/
+│       ├── core-test.scm
+│       ├── actors-test.scm
+│       ├── tasks-test.scm
+│       ├── state-machine-test.scm
+│       ├── storage-test.scm
+│       └── worker-pool-test.scm
+├── docs/
 │   ├── implementation.org    # Implementation details
-│   ├── design.org           # Design decisions
-│   ├── api.org              # API documentation
-│   └── notes.org            # Development notes
-├── examples/                 # Example applications
-│   ├── web-crawler.scm      # Distributed web crawler
-│   ├── map-reduce.scm       # MapReduce implementation
-│   └── pipeline.scm         # Data pipeline example
+│   ├── design.org            # Design decisions
+│   ├── core-enhanced.org     # Enhanced orchestrator spec
+│   ├── distributed.org       # Distributed coordination design
+│   ├── error-handling-tests.org # Error handling test scenarios
+│   └── state-storage.org     # State machine + storage design
+├── examples/
+│   └── simple-pipeline.scm  # Three-stage pipeline example
+├── benchmarks/
+│   └── performance.scm      # Microbenchmarks (tasks, actors, storage, pool)
 └── tmp/                      # Temporary files (ignored)
 #+END_SRC
 
 * Contributing
 
-Contributions are welcome! Please see [[file:CONTRIBUTING.org][CONTRIBUTING.org]] for guidelines.
+Contributions are welcome. No CONTRIBUTING.org yet -- follow standard PR workflow.
 
 * License
 
-This project is licensed under the MIT License. See [[file:LICENSE][LICENSE]] for details.
+MIT (no LICENSE file committed yet).
 
 * References
 

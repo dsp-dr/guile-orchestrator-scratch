@@ -1,0 +1,124 @@
+#+TITLE: Guile Orchestrator Scratch -- Specification
+#+AUTHOR: dsp-dr
+#+DATE: 2026-04-18
+
+* Purpose
+
+Distributed systems orchestration framework in GNU Guile 3.0+, exploring
+actor-model concurrency, event sourcing, and OTP-style supervision patterns
+in Scheme. This is a scratch/experimental repository.
+
+* Goals
+
+- Implement core distributed systems primitives in idiomatic Guile Scheme
+- Provide actor-based concurrency with supervision trees
+- Support content-addressable storage with write-ahead logging
+- Enable distributed coordination (leader election, locks, vector clocks)
+- Target FreeBSD as primary platform (macOS for development)
+
+* Non-Goals
+
+- Production readiness (this is a scratch repo)
+- Guile Fibers integration (uses raw threads currently)
+- Network transport (coordination is in-process only)
+- Real Raft/Paxos consensus (election is simplified/simulated)
+
+* Architecture
+
+** Module Map (src/orchestrator/)
+
+| Module           | Purpose                                          | LOC |
+|------------------+--------------------------------------------------+-----|
+| core.scm         | Orchestrator record, channel primitives, main loop | 124 |
+| core-enhanced.scm| Extended orchestrator with scheduler/dispatcher   | 488 |
+| actors.scm       | Actor record, mailbox, spawn, define-actor macro  |  65 |
+| tasks.scm        | Task record (pending/completed/failed lifecycle)  |  43 |
+| state-machine.scm| FSM engine with guards, actions, history, snapshots| 187 |
+| storage.scm      | Content-addressable store, WAL, memory+disk backends| 294 |
+| events.scm       | Event sourcing: append-only log, projections      | 109 |
+| errors.scm       | Error types, retry, timeout, circuit breaker      | 207 |
+| supervisor.scm   | OTP-style supervisor (one-for-one/all/rest)       | 176 |
+| worker-pool.scm  | Thread pool with work queue, stats, auto-scale    | 341 |
+| router.scm       | Pattern-matching message router                   |  70 |
+| coordination.scm | Leader election, distributed locks, vector clocks | 320 |
+
+Total: ~2,400 lines of Scheme.
+
+** Data Flow
+
+#+BEGIN_SRC text
+  Task submitted
+       |
+       v
+  Orchestrator (core / core-enhanced)
+       |
+   +---+---+
+   |       |
+   v       v
+ Scheduler  Dispatcher
+   |          |
+   v          v
+ Worker Pool  Actor System
+   |            |
+   v            v
+ Storage <-- Events (append-only log)
+   |
+   v
+ WAL (write-ahead log) --> Disk
+#+END_SRC
+
+** Concurrency Model
+
+All concurrency uses ~(ice-9 threads)~ with mutex/condvar channels.
+Guile Fibers are listed as a future goal but not integrated.
+The actor system uses one OS thread per actor via ~call-with-new-thread~.
+
+* Key Design Decisions
+
+- *Channels over Fibers*: Uses hand-rolled channel type (mutex + condvar + list)
+  rather than Fibers channels, keeping the dependency footprint minimal.
+- *Content-addressable storage*: Values are SHA256-hashed (stub implementation)
+  and stored by hash. WAL provides crash recovery.
+- *OTP supervision*: Three restart strategies (one-for-one, one-for-all,
+  rest-for-one) with restart-count limits and time windows.
+- *Circuit breaker*: Errors module includes a circuit breaker with
+  closed/half-open/open states and configurable threshold/timeout.
+- *Literate programming*: Build system expects org-mode files tangled via Emacs,
+  though source files also exist directly in src/.
+- *core vs core-enhanced*: Two orchestrator implementations coexist. ~core.scm~
+  is minimal; ~core-enhanced.scm~ adds config, metrics, lifecycle states,
+  scheduler, dispatcher, and monitor threads. They share the same module
+  name pattern but ~core-enhanced~ redefines channel primitives locally.
+
+* Test Suites
+
+| File                      | Covers                        |
+|---------------------------+-------------------------------|
+| core-test.scm             | Orchestrator creation, status |
+| actors-test.scm           | Actor spawn, message passing  |
+| tasks-test.scm            | Task lifecycle                |
+| state-machine-test.scm    | FSM transitions, guards       |
+| storage-test.scm          | Put/get/delete, WAL           |
+| worker-pool-test.scm      | Pool start/stop, work submit  |
+| integration-test.scm      | Cross-module integration      |
+
+Test runner uses SRFI-64. Run with ~gmake test~ (FreeBSD) or ~make test~.
+
+* Current Status
+
+- *Phase*: Experimental / scratch
+- *Completeness*: Core modules implemented; no network transport, no real
+  distributed operation (coordination is in-process simulation)
+- *CI*: GitHub Actions pipeline for Ubuntu + FreeBSD (tests run with ~|| true~)
+- *Platform*: Targets FreeBSD 14+; Makefile hardcodes ~guile3~/~guild3~
+
+* Known Limitations
+
+- ~core.scm~ and ~core-enhanced.scm~ both define orchestrator types with
+  conflicting exports (~make-orchestrator~, channel functions)
+- SHA256 in storage.scm is a stub (sum-based, not cryptographic)
+- No real network layer -- coordination module simulates votes with ~random~
+- Priority queue in core-enhanced is a stub (empty list)
+- Fibers not used despite README mentioning them as a key feature
+- CI tests use ~|| true~ so failures are silent
+- No ~guix.scm~, ~LICENSE~, or ~CONTRIBUTING.org~ despite README references
