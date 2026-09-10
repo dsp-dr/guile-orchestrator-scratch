@@ -8,6 +8,8 @@
   #:use-module (srfi srfi-19)
   #:export (make-worker-pool
             worker-pool?
+            pool-size
+            pool-workers
             
             ;; Pool management
             worker-pool-start!
@@ -82,11 +84,13 @@
   (format #f "pool-~a" (random 100000)))
 
 (define (make-pool-stats)
-  `((total-submitted . 0)
-    (total-completed . 0)
-    (total-failed . 0)
-    (average-wait-time . 0)
-    (average-execution-time . 0)))
+  ;; Build fresh pairs: a quoted literal is immutable in Guile 3 and
+  ;; assq-set!/set-cdr! on it raises "mutable pair" errors.
+  (list (cons 'total-submitted 0)
+        (cons 'total-completed 0)
+        (cons 'total-failed 0)
+        (cons 'average-wait-time 0)
+        (cons 'average-execution-time 0)))
 
 (define (worker-pool-start! pool)
   (let ((size (pool-size pool)))
@@ -172,7 +176,7 @@
              (begin
                ;; No work available, idle
                (set-worker-status! worker 'idle)
-               (sleep 0.1)
+               (usleep 100000)
                (loop))))))))
 
 (define (get-work pool)
@@ -257,7 +261,7 @@
     ;; Return a future-like object
     (lambda ()
       (while (not (atomic-box-ref done-box))
-        (sleep 0.01))
+        (usleep 10000))
       (let ((result (atomic-box-ref result-box)))
         (if (eq? (car result) 'error)
             (error "Task failed" (cdr result))

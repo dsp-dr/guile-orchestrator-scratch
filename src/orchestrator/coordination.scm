@@ -145,13 +145,12 @@
                       ;; Simulate vote (in real implementation, send RPC)
                       (when (> (random 100) 30) ; 70% chance of vote
                         (hash-set! votes (member-id member) #t))))
-                  members))
-      
-      ;; Check if won election (majority)
-      (let ((vote-count (hash-count (const #t) votes))
-            (majority (/ (+ 1 (length members)) 2)))
-        (when (> vote-count majority)
-          (become-leader! coord))))))
+                  members)
+        ;; Check if won election (majority) -- inside the members scope
+        (let ((vote-count (hash-count (const #t) votes))
+              (majority (/ (+ 1 (length members)) 2)))
+          (when (> vote-count majority)
+            (become-leader! coord)))))))
 
 (define (become-leader! coord)
   (let ((self (hash-ref (coordinator-members coord) 

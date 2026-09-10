@@ -11,6 +11,7 @@
             error-code
             error-message
             error-context
+            error-type
             
             ;; Specific errors
             make-task-error
@@ -104,7 +105,7 @@
                    (cancel-thread thread)
                    (raise (make-timeout-error 'operation seconds)))
                  (begin
-                   (sleep 0.1)
+                   (usleep 100000)
                    (loop (+ elapsed 0.1))))))))))
 
 (define-syntax with-fallback

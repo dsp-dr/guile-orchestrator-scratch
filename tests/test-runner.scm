@@ -17,7 +17,11 @@
 
 (define (run-test-file file)
   (format #t "Running tests from ~a...~%" file)
-  (load file))
+  ;; Guile resolves relative `load` paths against the loading file's directory,
+  ;; which would look for tests/tests/...; use an absolute path.
+  (load (if (absolute-file-name? file) file (string-append (getcwd) "/" file))))
+
+(define *total-failed* 0)
 
 (define (main args)
   (test-runner-factory
@@ -28,12 +32,15 @@
            (format #t "~%Test Summary:~%")
            (format #t "  Passed: ~a~%" (test-runner-pass-count runner))
            (format #t "  Failed: ~a~%" (test-runner-fail-count runner))
-           (format #t "  Skipped: ~a~%~%" (test-runner-skip-count runner))))
+           (format #t "  Skipped: ~a~%~%" (test-runner-skip-count runner))
+           ;; Each file runs its own test-begin/test-end; SRFI-64 in Guile
+           ;; >= 3.0.10 drops the current runner at test-end, so total here.
+           (set! *total-failed* (+ *total-failed* (test-runner-fail-count runner)))))
        runner)))
   
   (let ((test-files (find-test-files "tests")))
     (for-each run-test-file test-files))
   
-  (exit (if (zero? (test-runner-fail-count (test-runner-current))) 0 1)))
+  (exit (if (zero? *total-failed*) 0 1)))
 
 (main (command-line))

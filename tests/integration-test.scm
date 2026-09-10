@@ -2,6 +2,8 @@
 !#
 
 (use-modules (srfi srfi-64)
+             (srfi srfi-34)
+             (srfi srfi-26)
              (ice-9 threads)
              (orchestrator core-enhanced)
              (orchestrator supervisor)
@@ -24,14 +26,14 @@
       (test-equal 'running (orchestrator-state orch))
       
       (orchestrator-pause! orch)
-      (sleep 0.5)
+      (usleep 500000)
       (test-equal 'paused (orchestrator-state orch))
       
       (orchestrator-resume! orch)
       (test-equal 'running (orchestrator-state orch))
       
       (orchestrator-stop! orch)
-      (sleep 0.5)
+      (usleep 500000)
       (test-equal 'stopped (orchestrator-state orch))
       
       (orchestrator-shutdown! orch)
@@ -75,7 +77,7 @@
       (test-equal 2 (length (supervisor-children supervisor)))
       
       (supervisor-start! supervisor)
-      (sleep 0.5)
+      (usleep 500000)
       
       (supervisor-stop! supervisor)
       #t))
@@ -305,7 +307,7 @@
                     #:callback (lambda (result error)
                                 (set! results (cons result results))))
         
-        (sleep 0.5)
+        (usleep 500000)
         (test-equal '(6) results))
       
       ;; Check stats
@@ -346,7 +348,7 @@
       
       ;; Resize down
       (worker-pool-resize! pool 1)
-      (sleep 0.5)
+      (usleep 500000)
       (test-equal 1 (pool-size pool))
       
       (worker-pool-stop! pool)

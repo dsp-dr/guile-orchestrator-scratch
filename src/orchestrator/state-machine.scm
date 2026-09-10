@@ -9,6 +9,7 @@
             state-machine?
             state-machine-id
             state-machine-current-state
+            state-name
             
             ;; Definition
             define-state
@@ -114,7 +115,7 @@
     
     (if transition
         (if (check-guard sm transition args)
-            (perform-transition! sm transition args)
+            (perform-transition! sm transition event args)
             (begin
               (format #t "Guard failed for transition ~a -> ~a~%"
                       (transition-from transition)
@@ -125,7 +126,7 @@
                     (state-name current) event)
           #f))))
 
-(define (perform-transition! sm transition args)
+(define (perform-transition! sm transition event args)
   (let* ((current (state-machine-current-state sm))
          (target-name (transition-to transition))
          (target (hash-ref (state-machine-states sm) target-name)))
