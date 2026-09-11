@@ -8,6 +8,8 @@
   #:use-module (srfi srfi-19)
   #:export (make-worker-pool
             worker-pool?
+            pool-size
+            pool-workers
             
             ;; Pool management
             worker-pool-start!
@@ -43,9 +45,29 @@
   worker?
   (id worker-id)
   (thread worker-thread set-worker-thread!)
-  (status worker-status set-worker-status!)
+  (status worker-status-box)            ; atomic box, see set-worker-status!
   (current-task worker-current-task set-worker-current-task!)
   (stats worker-stats))
+
+(define (worker-status worker)
+  (atomic-box-ref (worker-status-box worker)))
+
+(define (set-worker-status! worker status)
+  "Set WORKER's status to STATUS unless a stop was requested.  'stopping
+is terminal: if the worker loop or execute-work could overwrite it with
+'idle, the worker would never see the request and worker-pool-stop!
+would block in join-thread forever."
+  (let ((box (worker-status-box worker)))
+    (let loop ((current (atomic-box-ref box)))
+      (unless (eq? current 'stopping)
+        (let ((seen (atomic-box-compare-and-swap! box current status)))
+          (unless (eq? seen current)
+            (loop seen)))))))
+
+(define (request-worker-stop! worker)
+  "Ask WORKER to exit once its current task, if any, has finished.  Idle
+and paused workers poll their status, so they notice within one tick."
+  (atomic-box-set! (worker-status-box worker) 'stopping))
 
 (define-record-type <worker-stats>
   (%make-worker-stats tasks-completed tasks-failed total-time idle-time)
@@ -82,11 +104,13 @@
   (format #f "pool-~a" (random 100000)))
 
 (define (make-pool-stats)
-  `((total-submitted . 0)
-    (total-completed . 0)
-    (total-failed . 0)
-    (average-wait-time . 0)
-    (average-execution-time . 0)))
+  ;; Build fresh pairs: a quoted literal is immutable in Guile 3 and
+  ;; assq-set!/set-cdr! on it raises "mutable pair" errors.
+  (list (cons 'total-submitted 0)
+        (cons 'total-completed 0)
+        (cons 'total-failed 0)
+        (cons 'average-wait-time 0)
+        (cons 'average-execution-time 0)))
 
 (define (worker-pool-start! pool)
   (let ((size (pool-size pool)))
@@ -105,9 +129,7 @@
 
 (define (worker-pool-stop! pool)
   ;; Signal all workers to stop
-  (for-each (lambda (worker)
-              (set-worker-status! worker 'stopping))
-            (pool-workers pool))
+  (for-each request-worker-stop! (pool-workers pool))
   
   ;; Wait for workers to finish
   (for-each (lambda (worker)
@@ -132,8 +154,7 @@
      ((< new-size current-size)
       ;; Remove workers
       (let ((to-remove (- current-size new-size)))
-        (for-each (lambda (worker)
-                    (set-worker-status! worker 'stopping))
+        (for-each request-worker-stop!
                   (take (pool-workers pool) to-remove))
         (set-pool-workers! pool 
                           (drop (pool-workers pool) to-remove)))))
@@ -142,7 +163,7 @@
 (define (create-worker pool index)
   (let* ((worker-id (format #f "worker-~a-~a" (pool-id pool) index))
          (stats (%make-worker-stats 0 0 0 0))
-         (worker (%make-worker worker-id #f 'idle #f stats)))
+         (worker (%make-worker worker-id #f (make-atomic-box 'idle) #f stats)))
     
     ;; Start worker thread
     (set-worker-thread! 
@@ -172,7 +193,7 @@
              (begin
                ;; No work available, idle
                (set-worker-status! worker 'idle)
-               (sleep 0.1)
+               (usleep 100000)
                (loop))))))))
 
 (define (get-work pool)
@@ -257,7 +278,7 @@
     ;; Return a future-like object
     (lambda ()
       (while (not (atomic-box-ref done-box))
-        (sleep 0.01))
+        (usleep 10000))
       (let ((result (atomic-box-ref result-box)))
         (if (eq? (car result) 'error)
             (error "Task failed" (cdr result))

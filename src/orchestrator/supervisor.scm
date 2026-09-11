@@ -7,6 +7,7 @@
   #:use-module (srfi srfi-9 gnu)
   #:export (make-supervisor
             supervisor?
+            supervisor-children
             supervisor-add-child!
             supervisor-remove-child!
             supervisor-restart-child!
