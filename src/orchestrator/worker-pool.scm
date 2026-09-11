@@ -45,9 +45,29 @@
   worker?
   (id worker-id)
   (thread worker-thread set-worker-thread!)
-  (status worker-status set-worker-status!)
+  (status worker-status-box)            ; atomic box, see set-worker-status!
   (current-task worker-current-task set-worker-current-task!)
   (stats worker-stats))
+
+(define (worker-status worker)
+  (atomic-box-ref (worker-status-box worker)))
+
+(define (set-worker-status! worker status)
+  "Set WORKER's status to STATUS unless a stop was requested.  'stopping
+is terminal: if the worker loop or execute-work could overwrite it with
+'idle, the worker would never see the request and worker-pool-stop!
+would block in join-thread forever."
+  (let ((box (worker-status-box worker)))
+    (let loop ((current (atomic-box-ref box)))
+      (unless (eq? current 'stopping)
+        (let ((seen (atomic-box-compare-and-swap! box current status)))
+          (unless (eq? seen current)
+            (loop seen)))))))
+
+(define (request-worker-stop! worker)
+  "Ask WORKER to exit once its current task, if any, has finished.  Idle
+and paused workers poll their status, so they notice within one tick."
+  (atomic-box-set! (worker-status-box worker) 'stopping))
 
 (define-record-type <worker-stats>
   (%make-worker-stats tasks-completed tasks-failed total-time idle-time)
@@ -109,9 +129,7 @@
 
 (define (worker-pool-stop! pool)
   ;; Signal all workers to stop
-  (for-each (lambda (worker)
-              (set-worker-status! worker 'stopping))
-            (pool-workers pool))
+  (for-each request-worker-stop! (pool-workers pool))
   
   ;; Wait for workers to finish
   (for-each (lambda (worker)
@@ -136,8 +154,7 @@
      ((< new-size current-size)
       ;; Remove workers
       (let ((to-remove (- current-size new-size)))
-        (for-each (lambda (worker)
-                    (set-worker-status! worker 'stopping))
+        (for-each request-worker-stop!
                   (take (pool-workers pool) to-remove))
         (set-pool-workers! pool 
                           (drop (pool-workers pool) to-remove)))))
@@ -146,7 +163,7 @@
 (define (create-worker pool index)
   (let* ((worker-id (format #f "worker-~a-~a" (pool-id pool) index))
          (stats (%make-worker-stats 0 0 0 0))
-         (worker (%make-worker worker-id #f 'idle #f stats)))
+         (worker (%make-worker worker-id #f (make-atomic-box 'idle) #f stats)))
     
     ;; Start worker thread
     (set-worker-thread! 
